@@ -18,20 +18,22 @@ const TAIL_BYTES = 512 * 1024;
 const SUBQ_ENDPOINT = "https://api.subq.ai/v1/systemone";
 
 export type Op = { at: number; text: string };
-export type Roll = { lastMessageAt: number; finished: boolean; ops: Op[] };
+// toolTimeoutSec：当前这一步工具调用里最长的 bash/eval timeout（0 = 没设）
+export type Roll = { lastMessageAt: number; finished: boolean; ops: Op[]; toolTimeoutSec: number };
 // 只读可选字段并按值比较，形状不对的条目自然被忽略
 type Entry = {
 	type?: string;
 	customType?: string;
 	timestamp?: string;
 	data?: { toolName?: string; intent?: string; args?: unknown };
-	message?: { role?: string; stopReason?: string };
+	message?: { role?: string; stopReason?: string; content?: { type?: string; arguments?: { timeout?: unknown } }[] };
 };
 
 /** 解析对话记录尾部：最后一条消息时间、是否已收工、工具操作摘要。 */
 export function rollCall(lines: string[]): Roll {
 	let lastMessageAt = 0;
 	let finished = false;
+	let toolTimeoutSec = 0;
 	const ops: Op[] = [];
 	for (const line of lines) {
 		let e: Entry;
@@ -47,8 +49,14 @@ export function rollCall(lines: string[]): Roll {
 		const m = e.message ?? {};
 		// 交了最终回复、被取消或报错停下的，都不算在岗
 		finished = m.role === "assistant" && ["stop", "aborted", "error"].includes(String(m.stopReason));
+		if (m.role !== "assistant") continue;
+		toolTimeoutSec = 0;
+		for (const part of m.content ?? []) {
+			const t = Number(part.type === "toolCall" ? part.arguments?.timeout : 0) || 0;
+			toolTimeoutSec = Math.max(toolTimeoutSec, t);
+		}
 	}
-	return { lastMessageAt, finished, ops };
+	return { lastMessageAt, finished, ops, toolTimeoutSec };
 }
 
 function tailLines(file: string): string[] {
@@ -103,9 +111,7 @@ export async function progressProbability(name: string, ops: Op[], fetchImpl = f
 export default function dianmao(pi: ExtensionAPI) {
 	const reported = new Map<string, number>(); // 名字 -> 已报过的最后消息时间，同一次卡住只报一次
 	const spunAt = new Map<string, number>(); // 名字 -> 上次交给 SubQ 时的时间点
-	let busy = false;
-
-	async function tick(dir: string) {
+	function tick(dir: string) {
 		const now = Date.now();
 		for (const f of readdirSync(dir)) {
 			if (!f.endsWith(".jsonl") || f.startsWith("__")) continue;
@@ -117,11 +123,14 @@ export default function dianmao(pi: ExtensionAPI) {
 			if (roll.finished || !roll.lastMessageAt) continue;
 
 			const idle = Math.floor((now - roll.lastMessageAt) / MIN);
-			if (idle >= STALL_MIN) {
+			// 显式设了长 timeout 的命令，等它自己的截止时间过了再算卡住
+			const limit = Math.max(STALL_MIN, roll.toolTimeoutSec > 0 ? Math.ceil(roll.toolTimeoutSec / 60) + 2 : 0);
+			if (idle >= limit) {
 				if (reported.get(name) !== roll.lastMessageAt) {
 					reported.set(name, roll.lastMessageAt);
+					const last = roll.ops.at(-1)?.text ?? "（无工具调用，可能是模型没回）";
 					pi.sendMessage(
-						{ customType: "dianmao", content: `[点卯] 小工 ${name} 已 ${idle} 分钟没有新消息，可能卡住了。对话记录：${file}`, display: true },
+						{ customType: "dianmao", content: `[点卯] 小工 ${name} 已 ${idle} 分钟没有新消息，可能卡住了。最后一步：${last}。对话记录：${file}`, display: true },
 						{ deliverAs: "aside" },
 					);
 				}
@@ -133,24 +142,24 @@ export default function dianmao(pi: ExtensionAPI) {
 			const fresh = roll.ops.filter(o => o.at >= since);
 			if (fresh.length < SPIN_MIN_OPS) continue;
 			spunAt.set(name, now);
-			// SubQ 失败不影响下一次卡住检查；本窗口不重试
-			const p = await progressProbability(name, fresh.slice(-40)).catch(() => undefined);
-			if (p !== undefined && p < SPIN_THRESHOLD) {
-				const mins = Math.round((now - since) / MIN);
-				pi.sendMessage(
-					{ customType: "dianmao", content: `[点卯] 小工 ${name} 最近 ${mins} 分钟做了 ${fresh.length} 次操作，SubQ 判断有进展的概率只有 ${(p * 100).toFixed(0)}%，可能在空转。对话记录：${file}`, display: true },
-					{ deliverAs: "aside" },
-				);
-			}
+			// 后台问 SubQ，不拖住其他小工的卡住检查；失败本窗口不重试
+			const mins = Math.round((now - since) / MIN);
+			progressProbability(name, fresh.slice(-40))
+				.then(p => {
+					if (p === undefined || p >= SPIN_THRESHOLD) return;
+					pi.sendMessage(
+						{ customType: "dianmao", content: `[点卯] 小工 ${name} 最近 ${mins} 分钟做了 ${fresh.length} 次操作，SubQ 判断有进展的概率只有 ${(p * 100).toFixed(0)}%，可能在空转。对话记录：${file}`, display: true },
+						{ deliverAs: "aside" },
+					);
+				})
+				.catch(() => {});
 		}
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
-		ctx.setInterval(async () => {
+		ctx.setInterval(() => {
 			const dir = ctx.sessionManager.getArtifactsDir();
-			if (busy || !dir || !existsSync(dir)) return;
-			busy = true;
-			try { await tick(dir); } finally { busy = false; }
+			if (dir && existsSync(dir)) tick(dir);
 		}, POLL_MS);
 	});
 }

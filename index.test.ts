@@ -45,3 +45,11 @@ test("SubQ 返回的概率原样取出，非数字返回 undefined", async () =>
 	const fail = (async () => new Response("no", { status: 500 })) as unknown as typeof fetch;
 	await expect(progressProbability("a", [], fail)).rejects.toThrow("SubQ HTTP 500");
 });
+
+test("toolTimeoutSec 取当前这一步里最大的 timeout，下一步换掉", () => {
+	const call = (timeout?: number) => ({ type: "toolCall", name: "bash", arguments: { command: "x", timeout } });
+	const step1 = msg("2026-10-14T10:00:00Z", { role: "assistant", stopReason: "toolUse", content: [call(30), call(1200)] });
+	expect(rollCall([step1, msg("2026-10-14T10:00:01Z", { role: "toolResult" })]).toolTimeoutSec).toBe(1200);
+	const step2 = msg("2026-10-14T10:20:00Z", { role: "assistant", stopReason: "toolUse", content: [call()] });
+	expect(rollCall([step1, step2]).toolTimeoutSec).toBe(0);
+});
