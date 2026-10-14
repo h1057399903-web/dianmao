@@ -16,9 +16,11 @@ omp 扩展：主会话每分钟清点一次 task 小工（子代理），出问�
 ## 安装
 
 ```sh
-omp plugin install npm:dianmao
+omp plugin install git+https://github.com./h1057399903-web/dianmao.git
 omp plugin upgrade dianmao   # 以后更新
 ```
+
+`github.com.` 末尾那个点是故意的：仓库是私有的，bun 遇到 GitHub 地址只走匿名 tarball 接口，会 404（[oven-sh/bun#19618](https://github.com/oven-sh/bun/issues/19618)）；加点后改走 git，用本机 git 凭据（`gh auth setup-git`）拉取。
 
 重开 omp 窗口生效，之后每个新窗口都自动带上。本地改代码时用 `omp plugin link /path/to/dianmao` 代替。
 
