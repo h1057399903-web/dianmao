@@ -1,5 +1,5 @@
 import { afterEach, expect, test, setSystemTime } from "bun:test";
-import { mkdtempSync, symlinkSync, writeFileSync, appendFileSync } from "node:fs";
+import { mkdtempSync, symlinkSync, writeFileSync, appendFileSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import dianmao, { progressProbability, rollCall } from "./index.ts";
@@ -141,4 +141,20 @@ test("巡检：SubQ 超时或报错不报警、不抛出，卡住检查照常", 
 	await settle();
 	expect(sent).toHaveLength(1);
 	expect(sent[0]).toContain("Stuck");
+});
+
+test("巡检：旧交卷文件不能遮住重新开工的小工", () => {
+	const dir = mkdtempSync(join(tmpdir(), "dianmao-"));
+	const now = Date.now();
+	for (const name of ["Revived", "Delivered"]) {
+		writeFileSync(join(dir, `${name}.jsonl`), call(now - 25 * MIN, "new-call"));
+		const md = join(dir, `${name}.md`);
+		writeFileSync(md, "上次的结果");
+		const at = new Date(now - (name === "Revived" ? 60 : 10) * MIN);
+		utimesSync(md, at, at);
+	}
+	const { sent, tick } = patrol(dir);
+	tick();
+	expect(sent).toHaveLength(1);
+	expect(sent[0]).toContain("Revived");
 });

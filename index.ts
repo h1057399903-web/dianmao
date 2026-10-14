@@ -140,8 +140,9 @@ export default function dianmao(pi: ExtensionAPI) {
 			let roll: Roll;
 			// 单个记录读失败（刚被移走、权限）只跳过它，下一轮再看
 			try {
-				if (existsSync(done) || now - statSync(file).mtimeMs > WINDOW_MIN * MIN) continue;
+				if (now - statSync(file).mtimeMs > WINDOW_MIN * MIN) continue;
 				roll = rollCall(tailLines(file));
+				if (existsSync(done) && statSync(done).mtimeMs >= roll.lastMessageAt) continue;
 			} catch { continue; }
 			if (roll.finished || !roll.lastMessageAt) continue;
 
@@ -173,8 +174,9 @@ export default function dianmao(pi: ExtensionAPI) {
 				.then(p => {
 					if (p === undefined || p >= SPIN_THRESHOLD) return;
 					// 等回答期间可能换了会话、小工收工、或已开始下一个窗口：旧结论作废
-					if (currentDir() !== dir || windowStart.get(name) !== now || existsSync(done)) return;
-					if (rollCall(tailLines(file)).finished) return;
+					if (currentDir() !== dir || windowStart.get(name) !== now) return;
+					const latest = rollCall(tailLines(file));
+					if (latest.finished || (existsSync(done) && statSync(done).mtimeMs >= latest.lastMessageAt)) return;
 					pi.sendMessage(
 						{ customType: "dianmao", content: `[点卯] 小工 ${name} 最近 ${mins} 分钟做了 ${fresh.length} 次操作，SubQ 判断有进展的概率只有 ${(p * 100).toFixed(0)}%，可能在空转。对话记录：${file}`, display: true },
 						{ deliverAs: "aside" },
