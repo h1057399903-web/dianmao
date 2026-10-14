@@ -3,8 +3,9 @@
 // 2. 空转：一直在动但没进展；每 SPIN_MIN 分钟把这段时间的操作摘要交给 SubQ 判断。
 // 只观察和报告；重试、催办、换人由主会话决定。
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import { Text } from "@oh-my-pi/pi-tui";
 import { readdirSync, statSync, existsSync, openSync, readSync, closeSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { userInfo } from "node:os";
 
 const MIN = 60_000;
@@ -125,7 +126,31 @@ export async function progressProbability(ops: Op[], fetchImpl = fetch): Promise
 	return typeof p === "number" ? p : undefined;
 }
 
+type AlertCard = {
+	kind: "stall" | "spin";
+	name: string;
+	evidence: string;
+	lastStep?: string;
+	file: string;
+};
+
 export default function dianmao(pi: ExtensionAPI) {
+	pi.registerMessageRenderer<AlertCard>("dianmao", (message, { expanded }, theme) => {
+		const alert = message.details;
+		if (!alert || !["stall", "spin"].includes(alert.kind)) return undefined;
+		const title = alert.kind === "stall" ? "疑似卡住" : "疑似空转";
+		const suggestion = alert.kind === "stall"
+			? "查看小工状态与最后一次工具调用，确认是否正在等待长任务。"
+			: "核对最近操作是否有新结果，再决定是否调整任务。";
+		const lines = [
+			theme.fg("warning", `点卯 · ${title}`),
+			`${alert.name} · ${alert.evidence}`,
+		];
+		if (alert.lastStep) lines.push(`最后操作  ${alert.lastStep}`);
+		lines.push("", `建议  ${suggestion}`, theme.fg("dim", `记录  ${expanded ? alert.file : basename(alert.file)}`));
+		if (!expanded) lines.push(theme.fg("dim", "展开详情可查看完整路径"));
+		return new Text(lines.join("\n"), 0, 0);
+	});
 	const reported = new Map<string, number>(); // 名字 -> 已报过的最后消息时间，同一次卡住只报一次
 	// 名字 -> 当前空转观察窗口的起点。第一次看到就开始计时，不跟着日志尾部滑动
 	const windowStart = new Map<string, number>();
@@ -155,7 +180,12 @@ export default function dianmao(pi: ExtensionAPI) {
 					const last = roll.ops.at(-1);
 					const step = last ? `${last.name}（${last.intent || "无说明"}）` : "（无工具调用，可能是模型没回）";
 					pi.sendMessage(
-						{ customType: "dianmao", content: `[点卯] 小工 ${name} 已 ${idle} 分钟没有新消息，可能卡住了。最后一步：${step}。对话记录：${file}`, display: true },
+						{
+							customType: "dianmao",
+							content: `[点卯] 小工 ${name} 已 ${idle} 分钟没有新消息，可能卡住了。最后一步：${step}。对话记录：${file}`,
+							display: true,
+							details: { kind: "stall", name, evidence: `${idle} 分钟无新消息`, lastStep: step, file } satisfies AlertCard,
+						},
 						{ deliverAs: "aside" },
 					);
 				}
@@ -178,7 +208,12 @@ export default function dianmao(pi: ExtensionAPI) {
 					const latest = rollCall(tailLines(file));
 					if (latest.finished || (existsSync(done) && statSync(done).mtimeMs >= latest.lastMessageAt)) return;
 					pi.sendMessage(
-						{ customType: "dianmao", content: `[点卯] 小工 ${name} 最近 ${mins} 分钟做了 ${fresh.length} 次操作，SubQ 判断有进展的概率只有 ${(p * 100).toFixed(0)}%，可能在空转。对话记录：${file}`, display: true },
+						{
+							customType: "dianmao",
+							content: `[点卯] 小工 ${name} 最近 ${mins} 分钟做了 ${fresh.length} 次操作，SubQ 判断有进展的概率只有 ${(p * 100).toFixed(0)}%，可能在空转。对话记录：${file}`,
+							display: true,
+							details: { kind: "spin", name, evidence: `${mins} 分钟 · ${fresh.length} 次操作 · SubQ 估计进展概率 ${(p * 100).toFixed(0)}%`, file } satisfies AlertCard,
+						},
 						{ deliverAs: "aside" },
 					);
 				})

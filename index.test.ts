@@ -24,8 +24,12 @@ function patrol(dir: string) {
 	const sent: string[] = [];
 	let tick = () => {};
 	const ctx = { sessionManager: { getArtifactsDir: () => dir }, setInterval: (fn: () => void) => { tick = fn; } };
-	const pi = { on: (_ev: string, h: (e: unknown, c: unknown) => void) => h({}, ctx), sendMessage: (m: { content: string }) => sent.push(m.content) };
-	dianmao(pi as unknown as Parameters<typeof dianmao>[0]); // 测试替身只实现用到的两个方法
+	const pi = {
+		on: (_ev: string, h: (e: unknown, c: unknown) => void) => h({}, ctx),
+		sendMessage: (m: { content: string }) => sent.push(m.content),
+		registerMessageRenderer: () => {},
+	};
+	dianmao(pi as unknown as Parameters<typeof dianmao>[0]); // 测试替身只实现巡检用到的方法
 	return { sent, tick: () => tick() };
 }
 // SubQ 是后台发出的、不对外暴露 promise；等事件循环跑完这一轮的回调链（不按时长猜）
