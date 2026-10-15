@@ -13,10 +13,10 @@ afterEach(() => {
 
 const MIN = 60_000;
 const iso = (ms: number) => new Date(ms).toISOString();
-const call = (at: number, id: string, args: Record<string, unknown> = { command: "make" }) =>
-	JSON.stringify({ type: "message", timestamp: iso(at), message: { role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", id, name: "bash", intent: "跑构建", arguments: args }] } });
-const result = (at: number, id: string, isError = false) =>
-	JSON.stringify({ type: "message", timestamp: iso(at), message: { role: "toolResult", toolCallId: id, isError } });
+const call = (at: number, id: string, args: Record<string, unknown> = { command: "make" }, name = "bash", intent = "跑构建") =>
+	JSON.stringify({ type: "message", timestamp: iso(at), message: { role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", id, name, intent, arguments: args }] } });
+const result = (at: number, id: string, isError = false, text = "", details: Record<string, unknown> = {}) =>
+	JSON.stringify({ type: "message", timestamp: iso(at), message: { role: "toolResult", toolCallId: id, isError, content: [{ type: "text", text }], details } });
 const final = (at: number, stopReason: string) => JSON.stringify({ type: "message", timestamp: iso(at), message: { role: "assistant", stopReason, content: [] } });
 
 /** 用真实默认导出跑巡检：返回发出的报警和手动触发一轮的函数。 */
@@ -72,14 +72,14 @@ test("发给 SubQ 的内容不含原始参数，相同参数指纹相同", async
 	let body = "";
 	const fake = (async (_u: unknown, init: { body: string }) => {
 		body = init.body;
-		return new Response(JSON.stringify({ answers: { progress: { noul: 0.3 } } }));
+		return new Response(JSON.stringify({ answers: { progress: { noul: 0.3 }, sufficient_evidence: { noul: 0.95 } } }));
 	}) as unknown as typeof fetch;
 	const ops = rollCall([call(0, "a", { command: "cat ~/.secret-token" }), call(1, "b", { command: "cat ~/.secret-token" })]).ops;
-	expect(await progressProbability(ops, fake)).toBe(0.3);
+	expect(await progressProbability({ goal: "核对权限", ops }, fake)).toBe(0.3);
 	expect(body).not.toContain("secret-token");
 	expect(ops[0].argsHash).toBe(ops[1].argsHash);
 	const fail = (async () => new Response("no", { status: 500 })) as unknown as typeof fetch;
-	await expect(progressProbability(ops, fail)).rejects.toThrow("SubQ HTTP 500");
+	await expect(progressProbability({ goal: "核对权限", ops }, fail)).rejects.toThrow("SubQ HTTP 500");
 });
 
 test("巡检：长工具已返回后按默认 20 分钟报卡住；仍在跑的长工具不报", () => {
@@ -114,7 +114,7 @@ function spinner() {
 	const t0 = Date.parse("2026-10-14T10:00:00Z");
 	setSystemTime(t0);
 	// 刚开工：只有任务消息，尾部还没有任何操作
-	writeFileSync(file, JSON.stringify({ type: "message", timestamp: iso(t0), message: { role: "user" } }));
+	writeFileSync(file, JSON.stringify({ type: "message", timestamp: iso(t0), message: { role: "user", content: [{ type: "text", text: "修复测试失败并验证结果" }] } }));
 	const p = patrol(dir);
 	p.tick(); // 第一次看到：开始计时
 	// 日志很忙：尾部只有最后 2 分钟的操作；窗口仍要从第一次看到算起
@@ -126,7 +126,7 @@ function spinner() {
 }
 
 test("巡检：观察窗口固定，忙碌日志照样送 SubQ；概率低就报空转", async () => {
-	globalThis.fetch = (async () => new Response(JSON.stringify({ answers: { progress: { noul: 0.05 } } }))) as unknown as typeof fetch;
+	globalThis.fetch = (async () => new Response(JSON.stringify({ answers: { progress: { noul: 0.05 }, sufficient_evidence: { noul: 0.95 } } }))) as unknown as typeof fetch;
 	const { sent, tick } = spinner();
 	tick();
 	await settle();
@@ -141,7 +141,7 @@ test("巡检：SubQ 回答前小工已收工，旧结论丢弃", async () => {
 	const { sent, tick, dir } = spinner();
 	tick();
 	writeFileSync(join(dir, "Spinner.md"), "done");
-	reply.resolve(new Response(JSON.stringify({ answers: { progress: { noul: 0.01 } } })));
+	reply.resolve(new Response(JSON.stringify({ answers: { progress: { noul: 0.01 }, sufficient_evidence: { noul: 0.95 } } })));
 	await settle();
 	expect(sent).toHaveLength(0);
 });
@@ -230,4 +230,98 @@ test("巡检：识别直接 429 与额度错误正文", () => {
 	expect(sent).toHaveLength(2);
 	expect(sent.some(s => s.includes("Direct429"))).toBe(true);
 	expect(sent.some(s => s.includes("Quota"))).toBe(true);
+});
+
+test("进展证据：测试失败逐步减少，后台启动不冒充已成功完成", () => {
+	const r = rollCall([
+		call(0, "a", { command: "bun test" }),
+		result(1000, "a", true, "2 pass\n3 fail\n[10.00ms]", { exitCode: 1 }),
+		call(2000, "b", { command: "bun test" }),
+		result(3000, "b", false, "5 pass\n0 fail\n[20.00ms]"),
+		call(4000, "c", { command: "bun test" }),
+		result(5000, "c", false, "background preview", { async: { state: "running", jobId: "bg_1" } }),
+	]);
+	expect(r.ops.map(o => o.tests)).toEqual([{ passed: 2, failed: 3 }, { passed: 5, failed: 0 }, undefined]);
+	expect(r.ops.map(o => o.status)).toEqual(["error", "ok", "running"]);
+	expect(r.ops[0].exitCode).toBe(1);
+	expect(r.ops[2].resultHash).toBeUndefined();
+});
+
+test("进展证据：相同结果忽略耗时噪音，不把阅读正文里的测试数字算成执行结果", () => {
+	const r = rollCall([
+		call(0, "a", { command: "bun test" }), result(1000, "a", true, "2 pass\n3 fail\n[10.00ms]"),
+		call(2000, "b", { command: "bun test" }), result(3000, "b", true, "2 pass\n3 fail\n[30.00ms]"),
+		call(4000, "c", { path: "tests.ts" }, "read"), result(5000, "c", false, "const example = '3 pass';"),
+	]);
+	expect(r.ops[0].resultHash).toBe(r.ops[1].resultHash);
+	expect(r.ops[2].tests).toBeUndefined();
+	expect(r.ops[2].activity).toBe("read");
+});
+
+test("外发范围：保留任务目标与结果摘要，凭据、代码、命令和工具输出正文不外发", async () => {
+	const goal = JSON.stringify({ type: "message", timestamp: iso(0), message: { role: "user", content: [{
+		type: "text", text: "Complete assignment thoroughly:\n\n# Target\n修复测试失败 password=goal-secret\n```ts\nconst PRIVATE_SOURCE = 1;\n```\n# Acceptance\n验证通过",
+	}] } });
+	const r = rollCall([
+		goal, call(1000, "a", { command: "bun test --token=command-secret" }, "bash", "验证结果 api_key=intent-secret"),
+		result(2000, "a", true, "PRIVATE_OUTPUT\n2 passed, 3 failed", { exitCode: 1 }),
+	]);
+	let body = "";
+	const fake = (async (_url: unknown, init: { body: string }) => {
+		body = init.body;
+		return new Response(JSON.stringify({ answers: { progress: { noul: 0.1 }, sufficient_evidence: { noul: 0.9 } } }));
+	}) as unknown as typeof fetch;
+	await progressProbability(r, fake);
+	expect(body).toContain("修复测试失败");
+	expect(body).toContain('"passed":2');
+	expect(body).toContain('"failed":3');
+	for (const secret of ["goal-secret", "command-secret", "intent-secret", "PRIVATE_SOURCE", "PRIVATE_OUTPUT", "bun test"]) expect(body).not.toContain(secret);
+});
+
+test("证据不足或概率不合法时，即使进展概率很低也不返回空转结论", async () => {
+	for (const answers of [
+		{ progress: { noul: 0.01 }, sufficient_evidence: { noul: 0.2 } },
+		{ progress: { noul: 0.01 } },
+		{ progress: { noul: -1 }, sufficient_evidence: { noul: 0.9 } },
+		{ progress: { noul: 0.01 }, sufficient_evidence: { noul: 2 } },
+	]) {
+		const fake = (async () => new Response(JSON.stringify({ answers }))) as unknown as typeof fetch;
+		expect(await progressProbability({ goal: "", ops: [] }, fake)).toBeUndefined();
+	}
+});
+
+test("巡检：大日志尾部不含任务目标时，从头部补目标；SubQ 等待期间有新进展则不报旧结论", async () => {
+	const reply = Promise.withResolvers<Response>();
+	let request = "";
+	globalThis.fetch = ((_url: unknown, init: { body: string }) => {
+		request = init.body;
+		return reply.promise;
+	}) as unknown as typeof fetch;
+	const { tick, file, sent } = spinner();
+	const before = await Bun.file(file).text();
+	const [goal, ...tail] = before.split("\n");
+	const padding = JSON.stringify({ type: "custom", data: "x".repeat(600 * 1024) });
+	writeFileSync(file, [goal, padding, ...tail].join("\n"));
+	tick();
+	expect(request).toContain("修复测试失败并验证结果");
+	appendFileSync(file, "\n" + call(Date.now() + 1000, "new-result"));
+	reply.resolve(new Response(JSON.stringify({ answers: { progress: { noul: 0.01 }, sufficient_evidence: { noul: 0.95 } } })));
+	await settle();
+	expect(sent).toEqual([]);
+});
+
+test("结果变化按相同操作比较，重复失败与结果改善不混淆", async () => {
+	const r = rollCall([
+		call(0, "a", { command: "bun test" }), result(1000, "a", true, "2 pass\n3 fail"),
+		call(2000, "b", { command: "bun test" }), result(3000, "b", true, "2 pass\n3 fail"),
+		call(4000, "c", { command: "bun test" }), result(5000, "c", false, "5 pass\n0 fail"),
+	]);
+	let changes: string[] = [];
+	const fake = (async (_url: unknown, init: { body: string }) => {
+		const request = JSON.parse(init.body) as { state: { operations: { resultChange: string }[] } };
+		changes = request.state.operations.map(op => op.resultChange);
+		return new Response(JSON.stringify({ answers: { progress: { noul: 0.9 }, sufficient_evidence: { noul: 0.9 } } }));
+	}) as unknown as typeof fetch;
+	await progressProbability({ goal: "修复测试失败", ops: r.ops }, fake);
+	expect(changes).toEqual(["first_observed", "unchanged", "changed"]);
 });
