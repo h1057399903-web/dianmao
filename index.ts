@@ -22,14 +22,18 @@ const SUBQ_ENDPOINT = "https://api.subq.ai/v1/systemone";
 // 发给 SubQ 的只有这些：不含原始命令、路径、正文。argsHash 只用来看出"参数是否相同"。
 export type Op = { at: number; name: string; intent: string; argsHash: string; status?: "ok" | "error"; secs?: number };
 // toolTimeoutSec：还没返回的工具调用里最长的显式 timeout（0 = 没有）
-export type Roll = { lastMessageAt: number; finished: boolean; ops: Op[]; toolTimeoutSec: number };
+type QuotaRetry = { since: number; count: number; model: string };
+export type Roll = { lastMessageAt: number; finished: boolean; ops: Op[]; toolTimeoutSec: number; quotaRetry?: QuotaRetry };
 type Part = { type?: unknown; id?: unknown; name?: unknown; intent?: unknown; arguments?: { timeout?: unknown; i?: unknown } };
 // 只读可选字段并按值比较，形状不对的条目被跳过
 type Entry = {
 	type?: unknown;
 	customType?: unknown;
 	timestamp?: unknown;
-	message?: { role?: unknown; stopReason?: unknown; toolCallId?: unknown; isError?: unknown; content?: unknown };
+	message?: {
+		role?: unknown; stopReason?: unknown; toolCallId?: unknown; isError?: unknown; content?: unknown;
+		errorStatus?: unknown; errorMessage?: unknown; model?: unknown;
+	};
 };
 
 /** 解析对话记录尾部：最后一条消息时间、是否已收工、操作摘要、未返回工具的超时豁免。 */
@@ -37,6 +41,7 @@ export function rollCall(lines: string[]): Roll {
 	let lastMessageAt = 0;
 	let finished = false;
 	let errorRun = 0;
+	let quotaRetry: QuotaRetry | undefined;
 	const ops: Op[] = [];
 	const pending = new Map<string, { op: Op; timeout: number }>();
 	for (const line of lines) {
@@ -47,6 +52,16 @@ export function rollCall(lines: string[]): Roll {
 		if (e.type === "custom" && e.customType === "session_exit") finished = true;
 		const m = e.message;
 		if (e.type !== "message" || !m || typeof m !== "object") continue;
+		// 网关可能用 503 包住实际的 429；只检查模型错误，不把工具正文里的“429”算成限流。
+		if (m.role === "assistant" && m.stopReason === "error" &&
+			(m.errorStatus === 429 || /\b429\b|quota|rate[_ -]?limit|resource_exhausted|额度|配额/i.test(String(m.errorMessage ?? "")))) {
+			const model = typeof m.model === "string" ? m.model : "未知模型";
+			quotaRetry = quotaRetry?.model === model
+				? { ...quotaRetry, count: quotaRetry.count + 1 }
+				: { since: at, count: 1, model };
+		} else {
+			quotaRetry = undefined;
+		}
 		// 连续报错是 harness 在自动重试（如额度用尽），不是收工；闲置从第一次报错算起，重试不刷新
 		errorRun = m.role === "assistant" && m.stopReason === "error" ? errorRun + 1 : 0;
 		if (errorRun <= 1) lastMessageAt = at;
@@ -76,7 +91,7 @@ export function rollCall(lines: string[]): Roll {
 		}
 	}
 	const toolTimeoutSec = Math.max(0, ...[...pending.values()].map(p => p.timeout));
-	return { lastMessageAt, finished, ops, toolTimeoutSec };
+	return { lastMessageAt, finished, ops, toolTimeoutSec, quotaRetry };
 }
 
 function tailLines(file: string): string[] {
@@ -130,7 +145,7 @@ export async function progressProbability(ops: Op[], fetchImpl = fetch): Promise
 }
 
 type AlertCard = {
-	kind: "stall" | "spin";
+	kind: "stall" | "spin" | "quota";
 	name: string;
 	evidence: string;
 	lastStep?: string;
@@ -140,11 +155,14 @@ type AlertCard = {
 export default function dianmao(pi: ExtensionAPI) {
 	pi.registerMessageRenderer<AlertCard>("dianmao", (message, { expanded }, theme) => {
 		const alert = message.details;
-		if (!alert || !["stall", "spin"].includes(alert.kind)) return undefined;
-		const title = alert.kind === "stall" ? "疑似卡住" : "疑似空转";
-		const suggestion = alert.kind === "stall"
-			? "查看小工状态与最后一次工具调用，确认是否正在等待长任务。"
-			: "核对最近操作是否有新结果，再决定是否调整任务。";
+		if (!alert || !["stall", "spin", "quota"].includes(alert.kind)) return undefined;
+		const title = alert.kind === "quota" ? "模型重试受阻"
+			: alert.kind === "stall" ? "疑似卡住" : "疑似空转";
+		const suggestion = alert.kind === "quota"
+			? "检查该小工的模型额度与限流情况，再决定等待额度恢复或调整模型配置。"
+			: alert.kind === "stall"
+				? "查看小工状态与最后一次工具调用，确认是否正在等待长任务。"
+				: "核对最近操作是否有新结果，再决定是否调整任务。";
 		const lines = [
 			theme.fg("warning", `点卯 · ${title}`),
 			`${alert.name} · ${alert.evidence}`,
@@ -155,6 +173,7 @@ export default function dianmao(pi: ExtensionAPI) {
 		return new Text(lines.join("\n"), 0, 0);
 	});
 	const reported = new Map<string, number>(); // 名字 -> 已报过的最后消息时间，同一次卡住只报一次
+	const quotaReported = new Map<string, number>(); // 记录路径 -> 已通知的额度错误轮次起点
 	// 名字 -> 当前空转观察窗口的起点。第一次看到就开始计时，不跟着日志尾部滑动
 	const windowStart = new Map<string, number>();
 
@@ -173,6 +192,29 @@ export default function dianmao(pi: ExtensionAPI) {
 				if (existsSync(done) && statSync(done).mtimeMs >= roll.lastMessageAt) continue;
 			} catch { continue; }
 			if (roll.finished || !roll.lastMessageAt) continue;
+
+			const retry = roll.quotaRetry;
+			if (retry) {
+				const minutes = Math.floor((now - retry.since) / MIN);
+				if (retry.count >= 3 && minutes >= 5) {
+					if (quotaReported.get(file) !== retry.since) {
+						quotaReported.set(file, retry.since);
+						const evidence = `${retry.model} · 连续 ${retry.count} 次限流／额度错误 · ${minutes} 分钟未恢复`;
+						pi.sendMessage(
+							{
+								customType: "dianmao",
+								content: `[点卯] 小工 ${name} 的模型重试受阻：${evidence}。429 也可能被网关包装成其他状态码。请检查额度与模型配置；点卯未自动停止或切换模型。对话记录：${file}`,
+								display: true,
+								details: { kind: "quota", name, evidence, file } satisfies AlertCard,
+							},
+							{ deliverAs: "aside" },
+						);
+					}
+					continue;
+				}
+			} else {
+				quotaReported.delete(file);
+			}
 
 			const idle = Math.floor((now - roll.lastMessageAt) / MIN);
 			// 正在跑显式设了长 timeout 的命令，等它自己的截止时间过了再算卡住

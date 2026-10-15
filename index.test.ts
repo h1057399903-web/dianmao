@@ -171,3 +171,63 @@ test("巡检：旧交卷文件不能遮住重新开工的小工", () => {
 	expect(sent).toHaveLength(1);
 	expect(sent[0]).toContain("Revived");
 });
+
+const quotaError = (at: number, errorStatus = 503, errorMessage = "503 [codebuddy-cn/hy4-preview] [429]: 额度已用尽") =>
+	JSON.stringify({ type: "message", timestamp: iso(at), message: { role: "assistant", stopReason: "error", content: [], model: "cbcn/hy4-preview", errorStatus, errorMessage } });
+
+test("巡检：503 包装的连续 429 在五分钟后报警，同轮重试不重复，恢复后可再报警", () => {
+	const dir = mkdtempSync(join(tmpdir(), "dianmao-"));
+	const file = join(dir, "Reviewer.jsonl");
+	const now = Date.now();
+	writeFileSync(file, [quotaError(now - 6 * MIN), quotaError(now - 3 * MIN), quotaError(now)].join("\n"));
+	const { sent, tick } = patrol(dir);
+	tick();
+	expect(sent).toHaveLength(1);
+	expect(sent[0]).toContain("cbcn/hy4-preview");
+	expect(sent[0]).toContain("429");
+	appendFileSync(file, "\n" + quotaError(now + MIN));
+	tick();
+	expect(sent).toHaveLength(1);
+	appendFileSync(file, "\n" + [
+		call(now + 2 * MIN, "recovered"),
+		quotaError(now + 3 * MIN), quotaError(now + 6 * MIN), quotaError(now + 9 * MIN),
+	].join("\n"));
+	setSystemTime(now + 9 * MIN);
+	tick();
+	expect(sent).toHaveLength(2);
+});
+
+test("巡检：短暂限流、次数不足、普通 503、成功恢复、取消和退出均不报额度重试", () => {
+	const dir = mkdtempSync(join(tmpdir(), "dianmao-"));
+	const now = Date.now();
+	const run = [quotaError(now - 6 * MIN), quotaError(now - 3 * MIN), quotaError(now)];
+	const cases = {
+		Brief: [quotaError(now - MIN), quotaError(now - MIN / 2), quotaError(now)],
+		TwoErrors: [quotaError(now - 6 * MIN), quotaError(now)],
+		ServerErrors: [-6, -3, 0].map(m => quotaError(now + m * MIN, 503, "Service unavailable")),
+		Recovered: [...run, call(now, "ok")],
+		Cancelled: [...run, final(now, "aborted")],
+		Exited: [...run, JSON.stringify({ type: "custom", customType: "session_exit", timestamp: iso(now) })],
+		ToolOutput: [...run, JSON.stringify({ type: "message", timestamp: iso(now), message: { role: "toolResult", content: [{ type: "text", text: "HTTP 429 额度已用尽" }] } })],
+	};
+	for (const [name, lines] of Object.entries(cases)) writeFileSync(join(dir, `${name}.jsonl`), lines.join("\n"));
+	const { sent, tick } = patrol(dir);
+	tick();
+	expect(sent).toEqual([]);
+});
+
+test("巡检：识别直接 429 与额度错误正文", () => {
+	const dir = mkdtempSync(join(tmpdir(), "dianmao-"));
+	const now = Date.now();
+	for (const [name, status, text] of [
+		["Direct429", 429, "Too Many Requests"],
+		["Quota", 403, "insufficient_quota"],
+	] as const) {
+		writeFileSync(join(dir, `${name}.jsonl`), [-6, -3, 0].map(m => quotaError(now + m * MIN, status, text)).join("\n"));
+	}
+	const { sent, tick } = patrol(dir);
+	tick();
+	expect(sent).toHaveLength(2);
+	expect(sent.some(s => s.includes("Direct429"))).toBe(true);
+	expect(sent.some(s => s.includes("Quota"))).toBe(true);
+});
