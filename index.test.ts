@@ -46,6 +46,15 @@ test("收工判定：最终回复、取消、报错、session_exit；收工后�
 	expect(rollCall([final(0, "stop"), woke]).finished).toBe(false);
 });
 
+test("连续报错是 harness 在重试：算在岗，闲置从第一次报错算起", () => {
+	const t = Date.parse("2026-10-14T10:00:00Z");
+	const retrying = rollCall([call(t, "a"), result(t + MIN, "a"), final(t + 2 * MIN, "error"), final(t + 7 * MIN, "error"), final(t + 12 * MIN, "error")]);
+	expect(retrying.finished).toBe(false);
+	expect(retrying.lastMessageAt).toBe(t + 2 * MIN);
+	// 重试成功后恢复正常计时
+	expect(rollCall([final(t, "error"), final(t + 5 * MIN, "error"), call(t + 6 * MIN, "b")]).lastMessageAt).toBe(t + 6 * MIN);
+});
+
 test("超时豁免只对还没返回的调用生效；返回后恢复", () => {
 	const t = Date.parse("2026-10-14T10:00:00Z");
 	expect(rollCall([call(t, "a", { command: "x", timeout: 7200 })]).toolTimeoutSec).toBe(7200);

@@ -36,6 +36,7 @@ type Entry = {
 export function rollCall(lines: string[]): Roll {
 	let lastMessageAt = 0;
 	let finished = false;
+	let errorRun = 0;
 	const ops: Op[] = [];
 	const pending = new Map<string, { op: Op; timeout: number }>();
 	for (const line of lines) {
@@ -46,9 +47,11 @@ export function rollCall(lines: string[]): Roll {
 		if (e.type === "custom" && e.customType === "session_exit") finished = true;
 		const m = e.message;
 		if (e.type !== "message" || !m || typeof m !== "object") continue;
-		lastMessageAt = at;
+		// 连续报错是 harness 在自动重试（如额度用尽），不是收工；闲置从第一次报错算起，重试不刷新
+		errorRun = m.role === "assistant" && m.stopReason === "error" ? errorRun + 1 : 0;
+		if (errorRun <= 1) lastMessageAt = at;
 		// 交了最终回复、被取消或报错停下的，都不算在岗
-		finished = m.role === "assistant" && ["stop", "aborted", "error"].includes(String(m.stopReason));
+		finished = m.role === "assistant" && ["stop", "aborted", "error"].includes(String(m.stopReason)) && errorRun <= 1;
 		if (m.role === "toolResult") {
 			const p = pending.get(String(m.toolCallId));
 			pending.delete(String(m.toolCallId));
