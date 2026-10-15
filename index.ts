@@ -1,13 +1,12 @@
-// 点卯：主会话定时清点小工（task 子代理），两种情况报到主会话：
-// 1. 卡住：最后一条对话消息 STALL_MIN 分钟没更新（通常是命令挂住或模型不回）。
-// 2. 空转：一直在动但没进展；每 SPIN_MIN 分钟把这段时间的操作摘要交给 SubQ 判断。
-// 只观察和报告；重试、催办、换人由主会话决定。
+// 点卯：观察小工的卡住、模型重试、疑似空转与长期缺少施工证据；只报告，不调度。
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { Text } from "@oh-my-pi/pi-tui";
 import { readdirSync, statSync, existsSync, openSync, readSync, closeSync } from "node:fs";
 import { basename, join } from "node:path";
 import { userInfo } from "node:os";
 import { createHmac, randomBytes } from "node:crypto";
+import { StringDecoder } from "node:string_decoder";
+import manifest from "./package.json";
 
 const MIN = 60_000;
 const num = (k: string, d: number) => Number(process.env[k]) || d;
@@ -16,8 +15,9 @@ const WINDOW_MIN = num("DIANMAO_WINDOW_MIN", 360);
 const SPIN_MIN = num("DIANMAO_SPIN_MIN", 30);
 const SPIN_MIN_OPS = num("DIANMAO_SPIN_MIN_OPS", 10);
 const SPIN_THRESHOLD = num("DIANMAO_SPIN_THRESHOLD", 0.2);
+const DELIVERY_MIN = num("DIANMAO_DELIVERY_MIN", 60);
 const POLL_MS = num("DIANMAO_POLL_SEC", 60) * 1000;
-const TAIL_BYTES = 512 * 1024;
+const READ_BYTES = 64 * 1024;
 const SUBQ_ENDPOINT = "https://api.subq.ai/v1/systemone";
 
 // 原始参数和结果只在本机生成比较指纹；不随证据发给 SubQ。
@@ -32,6 +32,7 @@ type QuotaRetry = { since: number; count: number; model: string };
 export type Roll = {
 	lastMessageAt: number; finished: boolean; ops: Op[]; toolTimeoutSec: number;
 	quotaRetry?: QuotaRetry; goal: string;
+	taskStartedAt?: number; requiresChanges: boolean; lastChangeAt?: number;
 };
 type Part = { type?: unknown; id?: unknown; name?: unknown; intent?: unknown; arguments?: Record<string, unknown> };
 // 只读可选字段并按值比较，形状不对的条目被跳过
@@ -82,105 +83,164 @@ function description(value: unknown, limit: number): string {
 
 function activity(name: string, args: Record<string, unknown>): Op["activity"] {
 	if (name === "bash" && /\b(?:bun|npm|pnpm|yarn)\s+(?:run\s+)?test\b|\b(?:pytest|vitest|jest)\b|\b(?:cargo|go|dotnet)\s+test\b/.test(String(args.command ?? ""))) return "test";
+	if (name === "bash" && /(?:^|[;&|]\s*)\s*(?:cat|head|tail|sed\s+-n|ls|git\s+(?:show|log|diff|status))\b/.test(String(args.command ?? ""))) return "read";
 	if (name === "read") return "read";
 	if (["find", "grep", "glob", "web_search"].includes(name)) return "search";
 	if (["edit", "write", "ast_edit"].includes(name) && !String(args.path ?? "").startsWith("xd://")) return "change";
 	return "other";
 }
 
-/** 解析对话记录尾部：最后一条消息时间、是否已收工、操作摘要、未返回工具的超时豁免。 */
-export function rollCall(lines: string[]): Roll {
-	let lastMessageAt = 0;
-	let finished = false;
-	let errorRun = 0;
-	let quotaRetry: QuotaRetry | undefined;
-	let goal = "";
-	const ops: Op[] = [];
-	const pending = new Map<string, { op: Op; timeout: number }>();
-	for (const line of lines) {
-		let e: Entry | null;
-		try { e = JSON.parse(line) as Entry | null; } catch { continue; }
-		if (!e || typeof e !== "object") continue;
-		const at = Date.parse(String(e.timestamp)) || 0;
-		if (e.type === "custom" && e.customType === "session_exit") finished = true;
-		const m = e.message;
-		if (e.type !== "message" || !m || typeof m !== "object") continue;
-		if (m.role === "user") {
-			const task = textContent(m.content).replace(/^Complete assignment thoroughly:\s*/i, "");
-			const target = task.match(/(?:^|\n)#+\s*(?:Target|Goal|目标|任务目标)\s*\n([\s\S]*?)(?=\n#+\s|$)/i)?.[1] ?? task;
-			goal = description(target, 400);
-		}
-		// 网关可能用 503 包住实际的 429；只检查模型错误，不把工具正文里的“429”算成限流。
-		if (m.role === "assistant" && m.stopReason === "error" &&
-			(m.errorStatus === 429 || /\b429\b|quota|rate[_ -]?limit|resource_exhausted|额度|配额/i.test(String(m.errorMessage ?? "")))) {
-			const model = typeof m.model === "string" ? m.model : "未知模型";
-			quotaRetry = quotaRetry?.model === model
-				? { ...quotaRetry, count: quotaRetry.count + 1 }
-				: { since: at, count: 1, model };
-		} else {
-			quotaRetry = undefined;
-		}
-		// 连续报错是 harness 在自动重试（如额度用尽），不是收工；闲置从第一次报错算起，重试不刷新
-		errorRun = m.role === "assistant" && m.stopReason === "error" ? errorRun + 1 : 0;
-		if (errorRun <= 1) lastMessageAt = at;
-		// 交了最终回复、被取消或报错停下的，都不算在岗
-		finished = m.role === "assistant" && ["stop", "aborted", "error"].includes(String(m.stopReason)) && errorRun <= 1;
-		if (m.role === "toolResult") {
-			const p = pending.get(String(m.toolCallId));
-			pending.delete(String(m.toolCallId));
-			if (p) {
-				const details = m.details && typeof m.details === "object" ? m.details as Record<string, unknown> : {};
-				const asyncJob = details.async && typeof details.async === "object" ? details.async as Record<string, unknown> : {};
-				p.op.status = asyncJob.state === "running" ? "running" : m.isError === true ? "error" : "ok";
-				p.op.secs = Math.round((at - p.op.at) / 1000);
-				if (typeof details.exitCode === "number") p.op.exitCode = details.exitCode;
-				if (typeof details.timedOut === "boolean") p.op.timedOut = details.timedOut;
-				if (p.op.status !== "running") {
-					const text = textContent(m.content);
-					const stable = text.replace(/^\s*(?:⟨)?(?:Wall(?: time)?|Duration|Time):.*$/gmi, "").replace(/\[\d+(?:\.\d+)?(?:ms|s)\]/g, "[duration]").trim();
-					if (stable) p.op.resultHash = fingerprint(stable);
-					if (p.op.activity === "test") {
-						const tests: NonNullable<Op["tests"]> = {};
-						for (const match of text.matchAll(/\b(\d+)\s+(pass(?:ed)?|fail(?:ed)?)\b/gi)) {
-							tests[match[2].toLowerCase().startsWith("pass") ? "passed" : "failed"] = Number(match[1]);
-						}
-						if (Object.keys(tests).length) p.op.tests = tests;
-					}
+class Transcript {
+	snapshot: Roll = { lastMessageAt: 0, finished: false, ops: [], toolTimeoutSec: 0, goal: "", requiresChanges: false };
+	private errorRun = 0;
+	private pending = new Map<string, { op: Op; timeout: number }>();
+
+	consume(lines: string[]): Roll {
+		let { lastMessageAt, finished, quotaRetry, goal, taskStartedAt, requiresChanges, lastChangeAt } = this.snapshot;
+		let ops = this.snapshot.ops;
+		let errorRun = this.errorRun;
+		const pending = this.pending;
+		for (const line of lines) {
+			let e: Entry | null;
+			try { e = JSON.parse(line) as Entry | null; } catch { continue; }
+			if (!e || typeof e !== "object") continue;
+			const at = Date.parse(String(e.timestamp)) || 0;
+			if (e.type === "custom" && e.customType === "session_exit") finished = true;
+			const m = e.message;
+			if (e.type !== "message" || !m || typeof m !== "object") continue;
+			if (m.role === "user") {
+				const task = textContent(m.content).replace(/^Complete assignment thoroughly:\s*/i, "");
+				const newAssignment = taskStartedAt === undefined || (!task.startsWith("[Wait interrupted") && (finished || /(?:^|\n)#+\s*(?:Target|Goal|目标|任务目标)\s*\n/i.test(task)));
+				if (newAssignment) {
+					const target = task.match(/(?:^|\n)#+\s*(?:Target|Goal|目标|任务目标)\s*\n([\s\S]*?)(?=\n#+\s|$)/i)?.[1] ?? task;
+					const change = task.match(/(?:^|\n)#+\s*(?:Change|Implementation|修改|实现)\s*\n([\s\S]*?)(?=\n#+\s|$)/i)?.[1] ?? "";
+					goal = change ? `${description(target, 120)} Required changes: ${description(change, 260)}` : description(target, 400);
+					const readOnly = /^(?:只读|仅(?:审查|调查|分析|排查))|\bread[- ]only\b/i.test(target.trim());
+					requiresChanges = !readOnly && (Boolean(change.trim()) || /^(?:实现|修复|新增|添加|修改|implement\b|fix\b|add\b|build\b)/i.test(target.trim()));
+					taskStartedAt = at;
+					lastChangeAt = undefined;
+					ops = [];
+					pending.clear();
+					errorRun = 0;
 				}
 			}
-			continue;
+			// 网关可能用 503 包住实际的 429；只检查模型错误，不把工具正文里的“429”算成限流。
+			if (m.role === "assistant" && m.stopReason === "error" &&
+				(m.errorStatus === 429 || /\b429\b|quota|rate[_ -]?limit|resource_exhausted|额度|配额/i.test(String(m.errorMessage ?? "")))) {
+				const model = typeof m.model === "string" ? m.model : "未知模型";
+				quotaRetry = quotaRetry?.model === model
+					? { ...quotaRetry, count: quotaRetry.count + 1 }
+					: { since: at, count: 1, model };
+			} else {
+				quotaRetry = undefined;
+			}
+			// 连续报错是 harness 在自动重试（如额度用尽），不是收工；闲置从第一次报错算起，重试不刷新
+			errorRun = m.role === "assistant" && m.stopReason === "error" ? errorRun + 1 : 0;
+			if (errorRun <= 1) lastMessageAt = at;
+			// 交了最终回复、被取消或报错停下的，都不算在岗
+			finished = m.role === "assistant" && ["stop", "aborted", "error"].includes(String(m.stopReason)) && errorRun <= 1;
+			if (m.role === "toolResult") {
+				const p = pending.get(String(m.toolCallId));
+				pending.delete(String(m.toolCallId));
+				if (p) {
+					const details = m.details && typeof m.details === "object" ? m.details as Record<string, unknown> : {};
+					const asyncJob = details.async && typeof details.async === "object" ? details.async as Record<string, unknown> : {};
+					p.op.status = asyncJob.state === "running" ? "running" : m.isError === true ? "error" : "ok";
+					p.op.secs = Math.round((at - p.op.at) / 1000);
+					if (typeof details.exitCode === "number") p.op.exitCode = details.exitCode;
+					if (typeof details.timedOut === "boolean") p.op.timedOut = details.timedOut;
+					if (p.op.activity === "change" && p.op.status === "ok" && !p.op.timedOut && (p.op.exitCode === undefined || p.op.exitCode === 0)) lastChangeAt = at;
+					if (p.op.status !== "running") {
+						const text = textContent(m.content);
+						const stable = text.replace(/^\s*(?:⟨)?(?:Wall(?: time)?|Duration|Time):.*$/gmi, "").replace(/\[\d+(?:\.\d+)?(?:ms|s)\]/g, "[duration]").trim();
+						if (stable) p.op.resultHash = fingerprint(stable);
+						if (p.op.activity === "test") {
+							const tests: NonNullable<Op["tests"]> = {};
+							for (const match of text.matchAll(/\b(\d+)\s+(pass(?:ed)?|fail(?:ed)?)\b/gi)) {
+								tests[match[2].toLowerCase().startsWith("pass") ? "passed" : "failed"] = Number(match[1]);
+							}
+							if (Object.keys(tests).length) p.op.tests = tests;
+						}
+					}
+				}
+				continue;
+			}
+			if (m.role !== "assistant" || !Array.isArray(m.content)) continue;
+			for (const part of m.content as (Part | null)[]) {
+				if (!part || typeof part !== "object" || part.type !== "toolCall") continue;
+				const { i: _intent, ...args } = part.arguments ?? {};
+				const op: Op = {
+					at,
+					name: String(part.name),
+					intent: description(part.intent ?? part.arguments?.i, 120),
+					argsHash: fingerprint(args),
+					activity: activity(String(part.name), args),
+				};
+				ops.push(op);
+				if (ops.length > Math.max(256, SPIN_MIN_OPS * 2)) ops = ops.slice(-Math.max(128, SPIN_MIN_OPS));
+				pending.set(String(part.id), { op, timeout: Number(part.arguments?.timeout) || 0 });
+			}
 		}
-		if (m.role !== "assistant" || !Array.isArray(m.content)) continue;
-		for (const part of m.content as (Part | null)[]) {
-			if (!part || typeof part !== "object" || part.type !== "toolCall") continue;
-			const { i: _intent, ...args } = part.arguments ?? {};
-			const op: Op = {
-				at,
-				name: String(part.name),
-				intent: description(part.intent ?? part.arguments?.i, 120),
-				argsHash: fingerprint(args),
-				activity: activity(String(part.name), args),
-			};
-			ops.push(op);
-			pending.set(String(part.id), { op, timeout: Number(part.arguments?.timeout) || 0 });
-		}
+		const toolTimeoutSec = Math.max(0, ...[...pending.values()].map(p => p.timeout));
+		this.errorRun = errorRun;
+		this.snapshot = { lastMessageAt, finished, ops, toolTimeoutSec, quotaRetry, goal, taskStartedAt, requiresChanges, lastChangeAt };
+		return this.snapshot;
 	}
-	const toolTimeoutSec = Math.max(0, ...[...pending.values()].map(p => p.timeout));
-	return { lastMessageAt, finished, ops, toolTimeoutSec, quotaRetry, goal };
 }
 
-function transcriptLines(file: string, edge: "head" | "tail" = "tail"): string[] {
-	const size = statSync(file).size;
-	const len = Math.min(size, TAIL_BYTES);
-	const buf = Buffer.alloc(len);
+/** 一次性解析接口；巡检通过同一解析器增量读取，保留目标、工具配对与施工证据。 */
+export function rollCall(lines: string[]): Roll {
+	return new Transcript().consume(lines);
+}
+
+type Cursor = {
+	parser: Transcript; offset: number; partial: string; decoder: StringDecoder;
+	dev: number; ino: number; mtimeMs: number; boundary: Buffer;
+};
+
+function readTranscript(file: string, cursors: Map<string, Cursor>): Roll {
+	const stat = statSync(file);
 	const fd = openSync(file, "r");
-	try { readSync(fd, buf, 0, len, edge === "head" ? 0 : size - len); } finally { closeSync(fd); }
-	const lines = buf.toString("utf8").split("\n");
-	if (len < size) {
-		if (edge === "head") lines.pop();
-		else lines.shift();
+	try {
+		let cursor = cursors.get(file);
+		// shortcut: 以追加式 JSONL 为契约；若上游原地改写历史且增长后边界不变，需接入日志版本号。
+		if (cursor) {
+			const boundary = Buffer.alloc(cursor.boundary.length);
+			readSync(fd, boundary, 0, boundary.length, cursor.offset - boundary.length);
+			if (stat.dev !== cursor.dev || stat.ino !== cursor.ino || stat.size < cursor.offset ||
+				(stat.size === cursor.offset && stat.mtimeMs !== cursor.mtimeMs) || !boundary.equals(cursor.boundary)) cursor = undefined;
+		}
+		if (!cursor) {
+			cursor = { parser: new Transcript(), offset: 0, partial: "", decoder: new StringDecoder("utf8"), dev: stat.dev, ino: stat.ino, mtimeMs: stat.mtimeMs, boundary: Buffer.alloc(0) };
+			cursors.set(file, cursor);
+		}
+		const buf = Buffer.alloc(Math.min(READ_BYTES, stat.size - cursor.offset));
+		while (cursor.offset < stat.size) {
+			const count = readSync(fd, buf, 0, Math.min(buf.length, stat.size - cursor.offset), cursor.offset);
+			if (!count) break;
+			cursor.offset += count;
+			cursor.partial += cursor.decoder.write(buf.subarray(0, count));
+			const end = cursor.partial.lastIndexOf("\n");
+			if (end >= 0) {
+				cursor.parser.consume(cursor.partial.slice(0, end).split("\n"));
+				cursor.partial = cursor.partial.slice(end + 1);
+			}
+		}
+		// 完整的末行允许没有换行；半写入的 JSON 留到下一轮，不能吞掉。
+		if (cursor.partial) {
+			try {
+				JSON.parse(cursor.partial);
+				cursor.parser.consume([cursor.partial]);
+				cursor.partial = "";
+			} catch {}
+		}
+		cursor.mtimeMs = stat.mtimeMs;
+		cursor.boundary = Buffer.alloc(Math.min(64, cursor.offset));
+		readSync(fd, cursor.boundary, 0, cursor.boundary.length, cursor.offset - cursor.boundary.length);
+		return cursor.parser.snapshot;
+	} finally {
+		closeSync(fd);
 	}
-	return lines.filter(Boolean);
 }
 
 let cachedKey: string | undefined;
@@ -247,7 +307,7 @@ export async function progressProbability({ goal, ops }: Pick<Roll, "goal" | "op
 }
 
 type AlertCard = {
-	kind: "stall" | "spin" | "quota";
+	kind: "stall" | "spin" | "quota" | "delivery";
 	name: string;
 	evidence: string;
 	lastStep?: string;
@@ -257,14 +317,17 @@ type AlertCard = {
 export default function dianmao(pi: ExtensionAPI) {
 	pi.registerMessageRenderer<AlertCard>("dianmao", (message, { expanded }, theme) => {
 		const alert = message.details;
-		if (!alert || !["stall", "spin", "quota"].includes(alert.kind)) return undefined;
+		if (!alert || !["stall", "spin", "quota", "delivery"].includes(alert.kind)) return undefined;
 		const title = alert.kind === "quota" ? "模型重试受阻"
-			: alert.kind === "stall" ? "疑似卡住" : "疑似空转";
+			: alert.kind === "delivery" ? "施工进展待核对"
+				: alert.kind === "stall" ? "疑似卡住" : "疑似空转";
 		const suggestion = alert.kind === "quota"
 			? "检查该小工的模型额度与限流情况，再决定等待额度恢复或调整模型配置。"
 			: alert.kind === "stall"
 				? "查看小工状态与最后一次工具调用，确认是否正在等待长任务。"
-				: "核对最近操作是否有新结果，再决定是否调整任务。";
+				: alert.kind === "delivery"
+					? "请小工给出已确认的根因或产物位置，核对是否该进入修改阶段；不代表已判定空转。"
+					: "核对最近操作是否有新结果，再决定是否调整任务。";
 		const lines = [
 			theme.fg("warning", `点卯 · ${title}`),
 			`${alert.name} · ${alert.evidence}`,
@@ -278,10 +341,38 @@ export default function dianmao(pi: ExtensionAPI) {
 	const quotaReported = new Map<string, number>(); // 记录路径 -> 已通知的额度错误轮次起点
 	// 名字 -> 当前空转观察窗口的起点。第一次看到就开始计时，不跟着日志尾部滑动
 	const windowStart = new Map<string, number>();
+	const deliveryReported = new Map<string, number>();
+	const cursors = new Map<string, Cursor>();
+	let sessionDir: string | undefined;
+	let lastSweepAt = 0;
+	let activeCount = 0;
+	let readFailures = 0;
+	let sweepFailed = false;
+	let lastSubQ = "尚未到检查窗口";
+
+	pi.registerCommand("dianmao", {
+		description: "查看点卯版本、最近巡检与 SubQ 状态",
+		handler: async (_args, ctx) => {
+			ctx.ui.notify(`点卯 ${manifest.version}\n最近成功巡检：${lastSweepAt ? new Date(lastSweepAt).toLocaleTimeString() : "尚未完成"}\n在岗记录：${activeCount}；读取失败：${readFailures}；巡检异常：${sweepFailed ? "是" : "否"}\n最近 SubQ：${lastSubQ}`, "info");
+		},
+	});
 
 	function tick(dir: string, currentDir: () => string | null) {
 		const now = Date.now();
-		for (const f of readdirSync(dir)) {
+		if (sessionDir !== dir) {
+			sessionDir = dir;
+			cursors.clear();
+			reported.clear();
+			quotaReported.clear();
+			deliveryReported.clear();
+			windowStart.clear();
+			lastSubQ = "尚未到检查窗口";
+		}
+		activeCount = 0;
+		readFailures = 0;
+		const files = new Set(readdirSync(dir));
+		for (const file of cursors.keys()) if (!files.has(basename(file))) cursors.delete(file);
+		for (const f of files) {
 			if (!f.endsWith(".jsonl") || f.startsWith("__")) continue;
 			const name = f.slice(0, -6);
 			const file = join(dir, f);
@@ -289,11 +380,15 @@ export default function dianmao(pi: ExtensionAPI) {
 			let roll: Roll;
 			// 单个记录读失败（刚被移走、权限）只跳过它，下一轮再看
 			try {
-				if (now - statSync(file).mtimeMs > WINDOW_MIN * MIN) continue;
-				roll = rollCall(transcriptLines(file));
+				if (now - statSync(file).mtimeMs > WINDOW_MIN * MIN) {
+					cursors.delete(file);
+					continue;
+				}
+				roll = readTranscript(file, cursors);
 				if (existsSync(done) && statSync(done).mtimeMs >= roll.lastMessageAt) continue;
-			} catch { continue; }
+			} catch { readFailures++; cursors.delete(file); continue; }
 			if (roll.finished || !roll.lastMessageAt) continue;
+			activeCount++;
 
 			const retry = roll.quotaRetry;
 			if (retry) {
@@ -339,7 +434,25 @@ export default function dianmao(pi: ExtensionAPI) {
 				continue;
 			}
 
-			const since = windowStart.get(name) ?? now;
+			const evidenceAt = roll.lastChangeAt ?? roll.taskStartedAt;
+			const waitingOnLongTool = roll.toolTimeoutSec > STALL_MIN * 60 && idle < limit;
+			if (roll.requiresChanges && evidenceAt !== undefined && !waitingOnLongTool &&
+				now - evidenceAt >= DELIVERY_MIN * MIN && deliveryReported.get(file) !== evidenceAt) {
+				deliveryReported.set(file, evidenceAt);
+				const minutes = Math.floor((now - evidenceAt) / MIN);
+				const evidence = `${minutes} 分钟未记录到成功修改操作`;
+				pi.sendMessage(
+					{
+						customType: "dianmao",
+						content: `[点卯] 小工 ${name} 的施工进展待核对：任务要求修改，但${evidence}。可能仍在有效排查，也可能迟迟未进入施工；请核对根因或产物位置。这里只依据工具记录，未检查 Git diff，也未判定空转。对话记录：${file}`,
+						display: true,
+						details: { kind: "delivery", name, evidence, file } satisfies AlertCard,
+					},
+					{ deliverAs: "aside" },
+				);
+			}
+
+			const since = Math.max(windowStart.get(name) ?? now, roll.taskStartedAt ?? 0);
 			windowStart.set(name, since);
 			if (now - since < SPIN_MIN * MIN) continue;
 			const fresh = roll.ops.filter(o => o.at >= since);
@@ -347,37 +460,55 @@ export default function dianmao(pi: ExtensionAPI) {
 			windowStart.set(name, now);
 			const mins = Math.round((now - since) / MIN);
 			// 后台问 SubQ，不拖住其他小工的卡住检查；失败本窗口不重试
-			// 大日志的目标可能已不在尾部；只在要问 SubQ 时补读头部，找不到就明确标为未知。
-			let goal = roll.goal;
-			if (!goal) {
-				try { goal = rollCall(transcriptLines(file, "head")).goal; } catch { continue; }
-			}
-			progressProbability({ goal, ops: fresh })
+			lastSubQ = `${name}：判断中`;
+			progressProbability({ goal: roll.goal, ops: fresh })
 				.then(p => {
-					if (p === undefined || p >= SPIN_THRESHOLD) return;
-					// 等回答期间可能换了会话、小工收工、或已开始下一个窗口：旧结论作废
 					if (currentDir() !== dir || windowStart.get(name) !== now) return;
-					const latest = rollCall(transcriptLines(file));
-					if (latest.finished || latest.lastMessageAt !== roll.lastMessageAt || (existsSync(done) && statSync(done).mtimeMs >= latest.lastMessageAt)) return;
+					lastSubQ = p === undefined ? `${name}：未形成结论（证据不足或不可用）` : `${name}：进展概率 ${(p * 100).toFixed(0)}%`;
+					if (p === undefined || p >= SPIN_THRESHOLD) return;
+					const latest = readTranscript(file, cursors);
+					if (latest.finished || latest.lastMessageAt !== roll.lastMessageAt || latest.taskStartedAt !== roll.taskStartedAt || (existsSync(done) && statSync(done).mtimeMs >= latest.lastMessageAt)) return;
 					pi.sendMessage(
 						{
 							customType: "dianmao",
-							content: `[点卯] 小工 ${name} 最近 ${mins} 分钟做了 ${fresh.length} 次操作，SubQ 判断有进展的概率只有 ${(p * 100).toFixed(0)}%，可能在空转。对话记录：${file}`,
+							content: `[点卯] 小工 ${name} 最近 ${mins} 分钟采样 ${fresh.length} 次操作，SubQ 判断有进展的概率只有 ${(p * 100).toFixed(0)}%，可能在空转。对话记录：${file}`,
 							display: true,
 							details: { kind: "spin", name, evidence: `${mins} 分钟 · ${fresh.length} 次操作 · SubQ 估计进展概率 ${(p * 100).toFixed(0)}%`, file } satisfies AlertCard,
 						},
 						{ deliverAs: "aside" },
 					);
 				})
-				.catch(() => {});
+				.catch(() => {
+					if (currentDir() === dir && windowStart.get(name) === now) lastSubQ = `${name}：请求或记录复查失败`;
+				});
 		}
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
+		lastSweepAt = 0;
+		activeCount = 0;
+		readFailures = 0;
+		sweepFailed = false;
+		lastSubQ = "尚未到检查窗口";
 		const currentDir = () => ctx.sessionManager.getArtifactsDir();
-		ctx.setInterval(() => {
+		const sweep = () => {
 			const dir = currentDir();
-			if (dir && existsSync(dir)) tick(dir, currentDir);
-		}, POLL_MS);
+			try {
+				if (!dir) {
+					ctx.ui.setStatus("dianmao", `点卯 ${manifest.version} · 等待会话记录`);
+					return;
+				}
+				if (existsSync(dir)) tick(dir, currentDir);
+				else { activeCount = 0; readFailures = 0; }
+				lastSweepAt = Date.now();
+				sweepFailed = false;
+				ctx.ui.setStatus("dianmao", `点卯 ${manifest.version} · 巡检 ${new Date(lastSweepAt).toLocaleTimeString()} · ${activeCount} 在岗${readFailures ? ` · ${readFailures} 读取失败` : ""}`);
+			} catch {
+				sweepFailed = true;
+				ctx.ui.setStatus("dianmao", `点卯 ${manifest.version} · 巡检失败，/dianmao 查看状态`);
+			}
+		};
+		ctx.ui.setStatus("dianmao", `点卯 ${manifest.version} · 等待首次巡检`);
+		ctx.setInterval(sweep, POLL_MS);
 	});
 }

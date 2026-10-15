@@ -23,11 +23,12 @@ const final = (at: number, stopReason: string) => JSON.stringify({ type: "messag
 function patrol(dir: string) {
 	const sent: string[] = [];
 	let tick = () => {};
-	const ctx = { sessionManager: { getArtifactsDir: () => dir }, setInterval: (fn: () => void) => { tick = fn; } };
+	const ctx = { sessionManager: { getArtifactsDir: () => dir }, setInterval: (fn: () => void) => { tick = fn; }, ui: { setStatus: () => {} } };
 	const pi = {
 		on: (_ev: string, h: (e: unknown, c: unknown) => void) => h({}, ctx),
 		sendMessage: (m: { content: string }) => sent.push(m.content),
 		registerMessageRenderer: () => {},
+		registerCommand: () => {},
 	};
 	dianmao(pi as unknown as Parameters<typeof dianmao>[0]); // 测试替身只实现巡检用到的方法
 	return { sent, tick: () => tick() };
@@ -324,4 +325,150 @@ test("结果变化按相同操作比较，重复失败与结果改善不混淆",
 	}) as unknown as typeof fetch;
 	await progressProbability({ goal: "修复测试失败", ops: r.ops }, fake);
 	expect(changes).toEqual(["first_observed", "unchanged", "changed"]);
+});
+
+test("施工超过一小时仍只有观察操作：SubQ 不可用也提醒核对，补充消息不重置任务", async () => {
+	const now = Date.now();
+	setSystemTime(now);
+	const dir = mkdtempSync(join(tmpdir(), "dianmao-delivery-"));
+	const task = JSON.stringify({ type: "message", timestamp: iso(now - 71 * MIN), message: { role: "user", content: "# Target\nCoral worktree，出站媒体。\n# Change\n实现文件发送并补测试。\n# Acceptance\n提交实现与验证结果。" } });
+	const update = JSON.stringify({ type: "message", timestamp: iso(now - 5 * MIN), message: { role: "user", content: "[Wait interrupted by message] <irc>补充：核对图片回调为什么丢失。</irc>" } });
+	const logs = [task, call(now - 6 * MIN, "read", { command: "cat runtime/adapter.mjs" }), result(now - 6 * MIN, "read"), final(now - 5.5 * MIN, "error"), update, call(now, "more", { command: "sed -n '1,100p' tests/media.test.mjs" }), result(now, "more")];
+	writeFileSync(join(dir, "Builder.jsonl"), logs.join("\n"));
+	globalThis.fetch = (() => Promise.reject(new Error("SubQ unavailable"))) as unknown as typeof fetch;
+	const p = patrol(dir);
+	p.tick();
+	await settle();
+	expect(p.sent).toHaveLength(1);
+	p.tick();
+	expect(p.sent).toHaveLength(1);
+	expect(rollCall(logs).goal).toContain("出站媒体");
+});
+
+test("施工核对不把只读任务、刚成功修改和仍在截止期内的长工具报成缺少修改", () => {
+	const now = Date.now();
+	setSystemTime(now);
+	const dir = mkdtempSync(join(tmpdir(), "dianmao-delivery-boundaries-"));
+	const task = (target: string, change = "") => JSON.stringify({ type: "message", timestamp: iso(now - 71 * MIN), message: { role: "user", content: `# Target\n${target}${change}` } });
+	writeFileSync(join(dir, "Research.jsonl"), [task("只读审查媒体协议，返回根因。", "\n# Change\n核对文件，不做实现。"), call(now, "r", { path: "adapter.mjs" }, "read"), result(now, "r")].join("\n"));
+	writeFileSync(join(dir, "Changed.jsonl"), [task("施工媒体协议", "\n# Change\n实现文件发送。"), call(now - 20 * MIN, "w", { path: "adapter.mjs", content: "fixed" }, "write"), result(now - 20 * MIN, "w"), call(now, "r", { path: "adapter.mjs" }, "read"), result(now, "r")].join("\n"));
+	writeFileSync(join(dir, "LongTool.jsonl"), [task("施工媒体协议", "\n# Change\n实现文件发送。"), call(now - 65 * MIN, "long", { command: "build", timeout: 7200 })].join("\n"));
+	const p = patrol(dir);
+	p.tick();
+	expect(p.sent).toEqual([]);
+});
+
+test("失败的修改不算施工成果；成功修改后重新计时，重新派工不沿用旧成果", () => {
+	const now = Date.now();
+	setSystemTime(now);
+	const dir = mkdtempSync(join(tmpdir(), "dianmao-delivery-restart-"));
+	const file = join(dir, "Builder.jsonl");
+	const task = (at: number) => JSON.stringify({ type: "message", timestamp: iso(at), message: { role: "user", content: "# Target\n施工媒体协议\n# Change\n实现文件发送。" } });
+	writeFileSync(file, [task(now - 71 * MIN), call(now - MIN, "bad", { path: "adapter.mjs" }, "edit"), result(now, "bad", true)].join("\n") + "\n");
+	const p = patrol(dir);
+	p.tick();
+	expect(p.sent).toHaveLength(1);
+	appendFileSync(file, [call(now + MIN, "good", { path: "adapter.mjs" }, "edit"), result(now + MIN, "good")].join("\n") + "\n");
+	setSystemTime(now + MIN);
+	p.tick();
+	expect(p.sent).toHaveLength(1);
+	appendFileSync(file, task(now + 2 * MIN) + "\n");
+	setSystemTime(now + 63 * MIN);
+	appendFileSync(file, [call(now + 63 * MIN, "r", { path: "adapter.mjs" }, "read"), result(now + 63 * MIN, "r")].join("\n") + "\n");
+	p.tick();
+	expect(p.sent).toHaveLength(2);
+});
+
+test("大日志跨块和跨轮工具配对：返回前遵守长超时，返回后恢复正常闲置计时", () => {
+	const now = Date.now();
+	setSystemTime(now);
+	const dir = mkdtempSync(join(tmpdir(), "dianmao-incremental-tool-"));
+	const file = join(dir, "Worker.jsonl");
+	writeFileSync(file, [call(now - 65 * MIN, "long", { command: "build", timeout: 7200 }), JSON.stringify({ type: "custom", data: "x".repeat(600_000) })].join("\n") + "\n");
+	const p = patrol(dir);
+	p.tick();
+	expect(p.sent).toEqual([]);
+	appendFileSync(file, result(now, "long") + "\n");
+	p.tick();
+	expect(p.sent).toEqual([]);
+	setSystemTime(now + 21 * MIN);
+	p.tick();
+	expect(p.sent).toHaveLength(1);
+});
+
+test("增量读取保留半写入 JSON 与分块 UTF-8，成功修改会重置施工提醒", () => {
+	const now = Date.now();
+	setSystemTime(now);
+	const dir = mkdtempSync(join(tmpdir(), "dianmao-partial-"));
+	const file = join(dir, "Worker.jsonl");
+	const task = JSON.stringify({ type: "message", timestamp: iso(now - 71 * MIN), message: { role: "user", content: "# Target\n实现媒体协议\n# Change\n实现文件发送。" } });
+	const output = Buffer.from(result(now, "write", false, "改好😀") + "\n");
+	const cut = output.indexOf(Buffer.from("😀")) + 2;
+	writeFileSync(file, Buffer.concat([Buffer.from([task, call(now, "write", { path: "adapter.mjs" }, "write"), ""].join("\n")), output.subarray(0, cut)]));
+	const p = patrol(dir);
+	p.tick();
+	expect(p.sent).toHaveLength(1);
+	appendFileSync(file, output.subarray(cut));
+	p.tick();
+	expect(p.sent).toHaveLength(1);
+	setSystemTime(now + 61 * MIN);
+	appendFileSync(file, [call(now + 61 * MIN, "r", { path: "adapter.mjs" }, "read"), result(now + 61 * MIN, "r")].join("\n") + "\n");
+	p.tick();
+	expect(p.sent).toHaveLength(2);
+});
+
+test("同名记录被覆盖且变大时，不能把旧任务的成功修改沿用给新任务", () => {
+	const now = Date.now();
+	setSystemTime(now);
+	const dir = mkdtempSync(join(tmpdir(), "dianmao-rewrite-"));
+	const file = join(dir, "Worker.jsonl");
+	const task = (at: number) => JSON.stringify({ type: "message", timestamp: iso(at), message: { role: "user", content: "# Target\n实现媒体协议\n# Change\n实现文件发送。" } });
+	writeFileSync(file, [task(now - 100 * MIN), call(now - MIN, "w", { path: "adapter.mjs" }, "write"), result(now - MIN, "w")].join("\n") + "\n");
+	const p = patrol(dir);
+	p.tick();
+	expect(p.sent).toEqual([]);
+	writeFileSync(file, [task(now - 71 * MIN), JSON.stringify({ type: "custom", data: "x".repeat(1000) }), call(now, "r", { path: "adapter.mjs" }, "read"), result(now, "r")].join("\n") + "\n");
+	p.tick();
+	expect(p.sent).toHaveLength(1);
+});
+
+test("收工后同名小工接到无标题的只读新任务，不继承旧施工任务的超时", () => {
+	const now = Date.now();
+	setSystemTime(now);
+	const dir = mkdtempSync(join(tmpdir(), "dianmao-new-round-"));
+	const user = (at: number, content: string) => JSON.stringify({ type: "message", timestamp: iso(at), message: { role: "user", content } });
+	writeFileSync(join(dir, "Worker.jsonl"), [
+		user(now - 100 * MIN, "# Target\n实现媒体协议\n# Change\n实现文件发送。"),
+		call(now - 90 * MIN, "w", { path: "adapter.mjs" }, "write"), result(now - 90 * MIN, "w"),
+		final(now - 80 * MIN, "stop"),
+		user(now - 70 * MIN, "只读审查文件发送，返回风险。"),
+		call(now, "r", { path: "adapter.mjs" }, "read"), result(now, "r"),
+	].join("\n") + "\n");
+	const p = patrol(dir);
+	p.tick();
+	expect(p.sent).toEqual([]);
+});
+
+test("同名小工换任务后，SubQ 必须重新积满观察窗口，不能借用上一任务的时间", async () => {
+	const now = Date.now();
+	setSystemTime(now);
+	const dir = mkdtempSync(join(tmpdir(), "dianmao-spin-round-"));
+	const file = join(dir, "Worker.jsonl");
+	const task = (at: number, target: string) => JSON.stringify({ type: "message", timestamp: iso(at), message: { role: "user", content: `# Target\n只读审查 ${target}` } });
+	writeFileSync(file, [task(now, "old"), call(now, "old", { path: "old.ts" }, "read"), result(now, "old")].join("\n") + "\n");
+	globalThis.fetch = (async () => new Response(JSON.stringify({ answers: { progress: { noul: 0.01 }, sufficient_evidence: { noul: 0.99 } } }))) as unknown as typeof fetch;
+	const p = patrol(dir);
+	p.tick();
+	setSystemTime(now + 31 * MIN);
+	const next = [task(now + 30 * MIN, "new")];
+	for (let i = 0; i < 12; i++) next.push(call(now + 31 * MIN, `new-${i}`, { path: "new.ts" }, "read"), result(now + 31 * MIN, `new-${i}`));
+	appendFileSync(file, next.join("\n") + "\n");
+	p.tick();
+	await settle();
+	expect(p.sent).toEqual([]);
+	setSystemTime(now + 61 * MIN);
+	appendFileSync(file, [call(now + 61 * MIN, "latest", { path: "new.ts" }, "read"), result(now + 61 * MIN, "latest")].join("\n") + "\n");
+	p.tick();
+	await settle();
+	expect(p.sent).toHaveLength(1);
 });

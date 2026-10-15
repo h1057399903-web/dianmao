@@ -1,8 +1,8 @@
 {
   "name": "dianmao",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
-  "description": "omp extension: roll call for task sub-agents — reports stalled ones and (via SubQ) spinning ones to the main session",
+  "description": "omp extension: observes stalled agents, model retries, unverified implementation progress and SubQ-assessed spinning",
   "type": "module",
   "omp": {
     "extensions": ["./index.ts"]
