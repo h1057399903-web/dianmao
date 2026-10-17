@@ -82,8 +82,11 @@ function description(value: unknown, limit: number): string {
 }
 
 function activity(name: string, args: Record<string, unknown>): Op["activity"] {
-	if (name === "bash" && /\b(?:bun|npm|pnpm|yarn)\s+(?:run\s+)?test\b|\b(?:pytest|vitest|jest)\b|\b(?:cargo|go|dotnet)\s+test\b/.test(String(args.command ?? ""))) return "test";
-	if (name === "bash" && /(?:^|[;&|]\s*)\s*(?:cat|head|tail|sed\s+-n|ls|git\s+(?:show|log|diff|status))\b/.test(String(args.command ?? ""))) return "read";
+	const command = String(args.command ?? "");
+	// 用 shell 改文件的小工常以提交收尾；提交是可核对的施工证据
+	if (name === "bash" && /\bgit\s+(?:-C\s+\S+\s+)?(?:commit|apply|am|cherry-pick)\b/.test(command)) return "change";
+	if (name === "bash" && /\b(?:bun|npm|pnpm|yarn)\s+(?:run\s+)?test\b|\b(?:pytest|vitest|jest)\b|\b(?:cargo|go|dotnet)\s+test\b/.test(command)) return "test";
+	if (name === "bash" && /(?:^|[;&|]\s*)\s*(?:cat|head|tail|sed\s+-n|ls|git\s+(?:show|log|diff|status))\b/.test(command)) return "read";
 	if (name === "read") return "read";
 	if (["find", "grep", "glob", "web_search"].includes(name)) return "search";
 	if (["edit", "write", "ast_edit"].includes(name) && !String(args.path ?? "").startsWith("xd://")) return "change";
@@ -94,6 +97,8 @@ class Transcript {
 	snapshot: Roll = { lastMessageAt: 0, finished: false, ops: [], toolTimeoutSec: 0, goal: "", requiresChanges: false };
 	private errorRun = 0;
 	private pending = new Map<string, { op: Op; timeout: number }>();
+	// 复活出的新记录会带上旧历史；文件头时间之前的事都不算这次在岗的时长
+	private sessionStartedAt = 0;
 
 	consume(lines: string[]): Roll {
 		let { lastMessageAt, finished, quotaRetry, goal, taskStartedAt, requiresChanges, lastChangeAt } = this.snapshot;
@@ -105,7 +110,16 @@ class Transcript {
 			try { e = JSON.parse(line) as Entry | null; } catch { continue; }
 			if (!e || typeof e !== "object") continue;
 			const at = Date.parse(String(e.timestamp)) || 0;
+			if (e.type === "session") this.sessionStartedAt = at;
 			if (e.type === "custom" && e.customType === "session_exit") finished = true;
+			// 收工后被 IRC 唤醒是新一轮工作：休眠时间不计入施工计时与观察窗口
+			if (e.type === "custom_message" && e.customType === "irc:incoming" && finished && taskStartedAt !== undefined) {
+				taskStartedAt = at;
+				lastChangeAt = undefined;
+				ops = [];
+				pending.clear();
+				errorRun = 0;
+			}
 			const m = e.message;
 			if (e.type !== "message" || !m || typeof m !== "object") continue;
 			if (m.role === "user") {
@@ -183,7 +197,12 @@ class Transcript {
 		}
 		const toolTimeoutSec = Math.max(0, ...[...pending.values()].map(p => p.timeout));
 		this.errorRun = errorRun;
-		this.snapshot = { lastMessageAt, finished, ops, toolTimeoutSec, quotaRetry, goal, taskStartedAt, requiresChanges, lastChangeAt };
+		const since = this.sessionStartedAt;
+		this.snapshot = {
+			lastMessageAt: Math.max(lastMessageAt, since), finished, ops, toolTimeoutSec, quotaRetry, goal,
+			taskStartedAt: taskStartedAt === undefined ? undefined : Math.max(taskStartedAt, since), requiresChanges,
+			lastChangeAt: lastChangeAt === undefined ? undefined : Math.max(lastChangeAt, since),
+		};
 		return this.snapshot;
 	}
 }
@@ -197,6 +216,27 @@ type Cursor = {
 	parser: Transcript; offset: number; partial: string; decoder: StringDecoder;
 	dev: number; ino: number; mtimeMs: number; boundary: Buffer;
 };
+
+type Header = { ino: number; id: string; parent?: string };
+// 只读文件头里的会话 id 与 parentSession；头还没写出来时不缓存，下一轮再读
+function sessionHeader(file: string, cache: Map<string, Header>): Header | undefined {
+	const ino = statSync(file).ino;
+	const cached = cache.get(file);
+	if (cached?.ino === ino) return cached;
+	const buf = Buffer.alloc(8192);
+	const fd = openSync(file, "r");
+	let count = 0;
+	try { count = readSync(fd, buf, 0, buf.length, 0); } finally { closeSync(fd); }
+	for (const line of buf.subarray(0, count).toString("utf8").split("\n")) {
+		let e: { type?: unknown; id?: unknown; parentSession?: unknown } | null;
+		try { e = JSON.parse(line); } catch { continue; }
+		if (e?.type !== "session" || typeof e.id !== "string") continue;
+		const header = { ino, id: e.id, parent: typeof e.parentSession === "string" ? e.parentSession : undefined };
+		cache.set(file, header);
+		return header;
+	}
+	return undefined;
+}
 
 function readTranscript(file: string, cursors: Map<string, Cursor>): Roll {
 	const stat = statSync(file);
@@ -337,12 +377,13 @@ export default function dianmao(pi: ExtensionAPI) {
 		if (!expanded) lines.push(theme.fg("dim", "展开详情可查看完整路径"));
 		return new Text(lines.join("\n"), 0, 0);
 	});
-	const reported = new Map<string, number>(); // 名字 -> 已报过的最后消息时间，同一次卡住只报一次
+	const reported = new Map<string, number>(); // 记录路径 -> 已报过的最后消息时间，同一次卡住只报一次
 	const quotaReported = new Map<string, number>(); // 记录路径 -> 已通知的额度错误轮次起点
-	// 名字 -> 当前空转观察窗口的起点。第一次看到就开始计时，不跟着日志尾部滑动
+	// 记录路径 -> 当前空转观察窗口的起点。第一次看到就开始计时，不跟着日志尾部滑动
 	const windowStart = new Map<string, number>();
 	const deliveryReported = new Map<string, number>();
 	const cursors = new Map<string, Cursor>();
+	const headers = new Map<string, Header>();
 	let sessionDir: string | undefined;
 	let lastSweepAt = 0;
 	let activeCount = 0;
@@ -362,6 +403,7 @@ export default function dianmao(pi: ExtensionAPI) {
 		if (sessionDir !== dir) {
 			sessionDir = dir;
 			cursors.clear();
+			headers.clear();
 			reported.clear();
 			quotaReported.clear();
 			deliveryReported.clear();
@@ -370,12 +412,29 @@ export default function dianmao(pi: ExtensionAPI) {
 		}
 		activeCount = 0;
 		readFailures = 0;
-		const files = new Set(readdirSync(dir));
-		for (const file of cursors.keys()) if (!files.has(basename(file))) cursors.delete(file);
+		const files = readdirSync(dir).filter(f => f.endsWith(".jsonl") && !f.startsWith("__"));
+		const present = new Set(files.map(f => join(dir, f)));
+		for (const file of cursors.keys()) if (!present.has(file)) cursors.delete(file);
+		for (const file of headers.keys()) if (!present.has(file)) headers.delete(file);
+		// 复活的小工另起一份带时间戳名的记录，parentSession 指回原记录：沿用原名，原记录不再单独清点
+		const nameById = new Map<string, string>();
+		const superseded = new Set<string>();
 		for (const f of files) {
-			if (!f.endsWith(".jsonl") || f.startsWith("__")) continue;
-			const name = f.slice(0, -6);
+			let header: Header | undefined;
+			try { header = sessionHeader(join(dir, f), headers); } catch { continue; }
+			if (!header) continue;
+			nameById.set(header.id, f.slice(0, -6));
+			if (header.parent) superseded.add(header.parent);
+		}
+		for (const f of files) {
 			const file = join(dir, f);
+			const header = headers.get(file);
+			if (header && superseded.has(header.id)) continue;
+			let name = f.slice(0, -6);
+			for (let parent = header?.parent, hops = 0; parent && nameById.has(parent) && hops < 8; hops++) {
+				name = nameById.get(parent)!;
+				parent = headers.get(join(dir, `${name}.jsonl`))?.parent;
+			}
 			const done = join(dir, `${name}.md`);
 			let roll: Roll;
 			// 单个记录读失败（刚被移走、权限）只跳过它，下一轮再看
@@ -417,8 +476,8 @@ export default function dianmao(pi: ExtensionAPI) {
 			// 正在跑显式设了长 timeout 的命令，等它自己的截止时间过了再算卡住
 			const limit = Math.max(STALL_MIN, roll.toolTimeoutSec > 0 ? Math.ceil(roll.toolTimeoutSec / 60) + 2 : 0);
 			if (idle >= limit) {
-				if (reported.get(name) !== roll.lastMessageAt) {
-					reported.set(name, roll.lastMessageAt);
+				if (reported.get(file) !== roll.lastMessageAt) {
+					reported.set(file, roll.lastMessageAt);
 					const last = roll.ops.at(-1);
 					const step = last ? `${last.name}（${last.intent || "无说明"}）` : "（无工具调用，可能是模型没回）";
 					pi.sendMessage(
@@ -452,18 +511,18 @@ export default function dianmao(pi: ExtensionAPI) {
 				);
 			}
 
-			const since = Math.max(windowStart.get(name) ?? now, roll.taskStartedAt ?? 0);
-			windowStart.set(name, since);
+			const since = Math.max(windowStart.get(file) ?? now, roll.taskStartedAt ?? 0);
+			windowStart.set(file, since);
 			if (now - since < SPIN_MIN * MIN) continue;
 			const fresh = roll.ops.filter(o => o.at >= since);
 			if (fresh.length < SPIN_MIN_OPS) continue;
-			windowStart.set(name, now);
+			windowStart.set(file, now);
 			const mins = Math.round((now - since) / MIN);
 			// 后台问 SubQ，不拖住其他小工的卡住检查；失败本窗口不重试
 			lastSubQ = `${name}：判断中`;
 			progressProbability({ goal: roll.goal, ops: fresh })
 				.then(p => {
-					if (currentDir() !== dir || windowStart.get(name) !== now) return;
+					if (currentDir() !== dir || windowStart.get(file) !== now) return;
 					lastSubQ = p === undefined ? `${name}：未形成结论（证据不足或不可用）` : `${name}：进展概率 ${(p * 100).toFixed(0)}%`;
 					if (p === undefined || p >= SPIN_THRESHOLD) return;
 					const latest = readTranscript(file, cursors);
@@ -479,12 +538,14 @@ export default function dianmao(pi: ExtensionAPI) {
 					);
 				})
 				.catch(() => {
-					if (currentDir() === dir && windowStart.get(name) === now) lastSubQ = `${name}：请求或记录复查失败`;
+					if (currentDir() === dir && windowStart.get(file) === now) lastSubQ = `${name}：请求或记录复查失败`;
 				});
 		}
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
+		// 扩展会绑定到每个子代理；只由主会话巡检，否则每个小工各报一遍还被报警唤醒
+		if (ctx.agent?.kind === "sub") return;
 		lastSweepAt = 0;
 		activeCount = 0;
 		readFailures = 0;

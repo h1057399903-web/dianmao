@@ -472,3 +472,66 @@ test("同名小工换任务后，SubQ 必须重新积满观察窗口，不能借
 	await settle();
 	expect(p.sent).toHaveLength(1);
 });
+
+const header = (at: number, id: string, parentSession?: string) => JSON.stringify({ type: "session", version: 3, id, timestamp: iso(at), ...(parentSession ? { parentSession } : {}) });
+const irc = (at: number) => JSON.stringify({ type: "custom_message", customType: "irc:incoming", timestamp: iso(at), content: "<irc>继续执行</irc>" });
+const buildTask = (at: number) => JSON.stringify({ type: "message", timestamp: iso(at), message: { role: "user", content: "# Target\n实现媒体协议\n# Change\n实现文件发送。" } });
+
+test("收工后被 IRC 唤醒：休眠时间不计入施工计时，恢复后满一小时无修改再提醒", () => {
+	const now = Date.now();
+	setSystemTime(now);
+	const dir = mkdtempSync(join(tmpdir(), "dianmao-resume-"));
+	const file = join(dir, "Worker.jsonl");
+	writeFileSync(file, [
+		buildTask(now - 300 * MIN),
+		call(now - 250 * MIN, "w", { path: "a.ts" }, "edit"), result(now - 250 * MIN, "w"),
+		final(now - 245 * MIN, "stop"),
+		irc(now - MIN),
+		call(now, "r", { path: "a.ts" }, "read"), result(now, "r"),
+	].join("\n") + "\n");
+	const p = patrol(dir);
+	p.tick();
+	expect(p.sent).toEqual([]);
+	setSystemTime(now + 60 * MIN);
+	appendFileSync(file, [call(now + 60 * MIN, "r2", { path: "a.ts" }, "read"), result(now + 60 * MIN, "r2")].join("\n") + "\n");
+	p.tick();
+	expect(p.sent).toHaveLength(1);
+});
+
+test("复活成新记录：用原小工的名字，不按复制来的旧历史报卡住或缺修改，原记录不再重复报", () => {
+	const now = Date.now();
+	setSystemTime(now);
+	const dir = mkdtempSync(join(tmpdir(), "dianmao-revived-"));
+	const history = [buildTask(now - 280 * MIN), call(now - 240 * MIN, "x", { path: "a.ts" }, "read"), result(now - 240 * MIN, "x")];
+	writeFileSync(join(dir, "ChannelReviewFixes.jsonl"), [header(now - 280 * MIN, "orig-id"), ...history].join("\n") + "\n");
+	writeFileSync(join(dir, "2026-10-17T01-17-38-039Z_01a1476f.jsonl"), [header(now - MIN, "new-id", "orig-id"), ...history, irc(now - MIN), call(now, "y", { path: "a.ts" }, "read"), result(now, "y")].join("\n") + "\n");
+	const p = patrol(dir);
+	p.tick();
+	expect(p.sent).toEqual([]);
+	setSystemTime(now + 60 * MIN);
+	appendFileSync(join(dir, "2026-10-17T01-17-38-039Z_01a1476f.jsonl"), [call(now + 60 * MIN, "z", { path: "a.ts" }, "read"), result(now + 60 * MIN, "z")].join("\n") + "\n");
+	p.tick();
+	expect(p.sent).toHaveLength(1);
+	expect(p.sent[0]).toContain("小工 ChannelReviewFixes ");
+});
+
+test("子代理会话不巡检，避免每个小工各报一遍并被报警唤醒", () => {
+	const dir = mkdtempSync(join(tmpdir(), "dianmao-sub-"));
+	let scheduled = false;
+	const ctx = { agent: { kind: "sub" }, sessionManager: { getArtifactsDir: () => dir }, setInterval: () => { scheduled = true; }, ui: { setStatus: () => {} } };
+	const pi = { on: (_ev: string, h: (e: unknown, c: unknown) => void) => h({}, ctx), sendMessage: () => {}, registerMessageRenderer: () => {}, registerCommand: () => {} };
+	dianmao(pi as unknown as Parameters<typeof dianmao>[0]);
+	expect(scheduled).toBe(false);
+});
+
+test("成功的 git commit 算施工成果；提交失败不算", () => {
+	const now = Date.now();
+	setSystemTime(now);
+	const dir = mkdtempSync(join(tmpdir(), "dianmao-commit-"));
+	writeFileSync(join(dir, "Committed.jsonl"), [buildTask(now - 71 * MIN), call(now - 5 * MIN, "c", { command: "cd /w && git commit -qam fix && git status --short" }), result(now - 5 * MIN, "c", false, "", { exitCode: 0 }), call(now, "r", { path: "a.ts" }, "read"), result(now, "r")].join("\n") + "\n");
+	writeFileSync(join(dir, "Failed.jsonl"), [buildTask(now - 71 * MIN), call(now - 5 * MIN, "c", { command: "git commit -m fix" }), result(now - 5 * MIN, "c", true, "nothing to commit", { exitCode: 1 }), call(now, "r", { path: "a.ts" }, "read"), result(now, "r")].join("\n") + "\n");
+	const p = patrol(dir);
+	p.tick();
+	expect(p.sent).toHaveLength(1);
+	expect(p.sent[0]).toContain("小工 Failed ");
+});
