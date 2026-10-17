@@ -40,11 +40,27 @@ function settle() {
 	return promise;
 }
 
-test("收工判定：最终回复、取消、报错、session_exit；收工后再被唤醒算在岗", () => {
-	for (const s of ["stop", "aborted", "error"]) expect(rollCall([final(0, s)]).finished).toBe(true);
+test("收工判定：最终回复、取消、session_exit；收工后再被唤醒算在岗", () => {
+	for (const s of ["stop", "aborted"]) expect(rollCall([final(0, s)]).finished).toBe(true);
 	expect(rollCall([result(0, "a"), JSON.stringify({ type: "custom", customType: "session_exit", timestamp: iso(1) })]).finished).toBe(true);
 	const woke = JSON.stringify({ type: "message", timestamp: iso(2), message: { role: "user" } });
 	expect(rollCall([final(0, "stop"), woke]).finished).toBe(false);
+});
+
+test("单次模型报错后没有后续：不算收工，满闲置阈值报卡住并说明是模型请求出错", () => {
+	const now = Date.now();
+	setSystemTime(now);
+	const dir = mkdtempSync(join(tmpdir(), "dianmao-error-hang-"));
+	const failed = JSON.stringify({ type: "message", timestamp: iso(now - 22 * MIN), message: { role: "assistant", stopReason: "error", errorMessage: "The socket connection was closed unexpectedly.", content: [] } });
+	writeFileSync(join(dir, "Worker.jsonl"), [call(now - 23 * MIN, "a"), result(now - 23 * MIN, "a"), failed].join("\n") + "\n");
+	// 真正结束的小工会留下结果文件，不应报
+	writeFileSync(join(dir, "Ended.jsonl"), [call(now - 23 * MIN, "a"), result(now - 23 * MIN, "a"), failed].join("\n") + "\n");
+	writeFileSync(join(dir, "Ended.md"), "failed");
+	const p = patrol(dir);
+	p.tick();
+	expect(p.sent).toHaveLength(1);
+	expect(p.sent[0]).toContain("小工 Worker ");
+	expect(p.sent[0]).toContain("socket connection was closed");
 });
 
 test("连续报错是 harness 在重试：算在岗，闲置从第一次报错算起", () => {

@@ -33,6 +33,8 @@ export type Roll = {
 	lastMessageAt: number; finished: boolean; ops: Op[]; toolTimeoutSec: number;
 	quotaRetry?: QuotaRetry; goal: string;
 	taskStartedAt?: number; requiresChanges: boolean; lastChangeAt?: number;
+	/** 最后一条是模型报错时的错误摘要；之后有任何消息即清除 */
+	modelError?: string;
 };
 type Part = { type?: unknown; id?: unknown; name?: unknown; intent?: unknown; arguments?: Record<string, unknown> };
 // 只读可选字段并按值比较，形状不对的条目被跳过
@@ -101,7 +103,7 @@ class Transcript {
 	private sessionStartedAt = 0;
 
 	consume(lines: string[]): Roll {
-		let { lastMessageAt, finished, quotaRetry, goal, taskStartedAt, requiresChanges, lastChangeAt } = this.snapshot;
+		let { lastMessageAt, finished, quotaRetry, goal, taskStartedAt, requiresChanges, lastChangeAt, modelError } = this.snapshot;
 		let ops = this.snapshot.ops;
 		let errorRun = this.errorRun;
 		const pending = this.pending;
@@ -151,8 +153,9 @@ class Transcript {
 			// 连续报错是 harness 在自动重试（如额度用尽），不是收工；闲置从第一次报错算起，重试不刷新
 			errorRun = m.role === "assistant" && m.stopReason === "error" ? errorRun + 1 : 0;
 			if (errorRun <= 1) lastMessageAt = at;
-			// 交了最终回复、被取消或报错停下的，都不算在岗
-			finished = m.role === "assistant" && ["stop", "aborted", "error"].includes(String(m.stopReason)) && errorRun <= 1;
+			// 交了最终回复或被取消算收工。模型报错不算：OMP 会自动续跑，真正结束时会写结果文件或 session_exit
+			finished = m.role === "assistant" && ["stop", "aborted"].includes(String(m.stopReason));
+			modelError = m.role === "assistant" && m.stopReason === "error" ? description(m.errorMessage, 120) || "未知错误" : undefined;
 			if (m.role === "toolResult") {
 				const p = pending.get(String(m.toolCallId));
 				pending.delete(String(m.toolCallId));
@@ -199,7 +202,7 @@ class Transcript {
 		this.errorRun = errorRun;
 		const since = this.sessionStartedAt;
 		this.snapshot = {
-			lastMessageAt: Math.max(lastMessageAt, since), finished, ops, toolTimeoutSec, quotaRetry, goal,
+			lastMessageAt: Math.max(lastMessageAt, since), finished, ops, toolTimeoutSec, quotaRetry, goal, modelError,
 			taskStartedAt: taskStartedAt === undefined ? undefined : Math.max(taskStartedAt, since), requiresChanges,
 			lastChangeAt: lastChangeAt === undefined ? undefined : Math.max(lastChangeAt, since),
 		};
@@ -479,7 +482,8 @@ export default function dianmao(pi: ExtensionAPI) {
 				if (reported.get(file) !== roll.lastMessageAt) {
 					reported.set(file, roll.lastMessageAt);
 					const last = roll.ops.at(-1);
-					const step = last ? `${last.name}（${last.intent || "无说明"}）` : "（无工具调用，可能是模型没回）";
+					const step = roll.modelError ? `模型请求报错后无后续（${roll.modelError}）`
+						: last ? `${last.name}（${last.intent || "无说明"}）` : "（无工具调用，可能是模型没回）";
 					pi.sendMessage(
 						{
 							customType: "dianmao",
