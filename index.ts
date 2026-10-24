@@ -16,6 +16,7 @@ const SPIN_MIN = num("DIANMAO_SPIN_MIN", 30);
 const SPIN_MIN_OPS = num("DIANMAO_SPIN_MIN_OPS", 10);
 const SPIN_THRESHOLD = num("DIANMAO_SPIN_THRESHOLD", 0.2);
 const DELIVERY_MIN = num("DIANMAO_DELIVERY_MIN", 60);
+const REMIND_MIN = num("DIANMAO_REMIND_MIN", 60);
 const POLL_MS = num("DIANMAO_POLL_SEC", 60) * 1000;
 const READ_BYTES = 64 * 1024;
 const SUBQ_ENDPOINT = "https://api.subq.ai/v1/systemone";
@@ -367,7 +368,7 @@ export default function dianmao(pi: ExtensionAPI) {
 		const suggestion = alert.kind === "quota"
 			? "检查该小工的模型额度与限流情况，再决定等待额度恢复或调整模型配置。"
 			: alert.kind === "stall"
-				? "查看小工状态与最后一次工具调用，确认是否正在等待长任务。"
+				? "工具仍在运行：确认是否在等长任务。工具已返回、模型没回应：IRC 唤不醒它，考虑停掉重派。"
 				: alert.kind === "delivery"
 					? "请小工给出已确认的根因或产物位置，核对是否该进入修改阶段；不代表已判定空转。"
 					: "核对最近操作是否有新结果，再决定是否调整任务。";
@@ -380,7 +381,8 @@ export default function dianmao(pi: ExtensionAPI) {
 		if (!expanded) lines.push(theme.fg("dim", "展开详情可查看完整路径"));
 		return new Text(lines.join("\n"), 0, 0);
 	});
-	const reported = new Map<string, number>(); // 记录路径 -> 已报过的最后消息时间，同一次卡住只报一次
+	// 记录路径 -> 这次卡住的最后消息时间、上次提醒时间与次数；同一次卡住每满 REMIND_MIN 再提醒
+	const reported = new Map<string, { at: number; sentAt: number; count: number }>();
 	const quotaReported = new Map<string, number>(); // 记录路径 -> 已通知的额度错误轮次起点
 	// 记录路径 -> 当前空转观察窗口的起点。第一次看到就开始计时，不跟着日志尾部滑动
 	const windowStart = new Map<string, number>();
@@ -485,17 +487,27 @@ export default function dianmao(pi: ExtensionAPI) {
 			// 正在跑显式设了长 timeout 的命令，等它自己的截止时间过了再算卡住
 			const limit = Math.max(STALL_MIN, roll.toolTimeoutSec > 0 ? Math.ceil(roll.toolTimeoutSec / 60) + 2 : 0);
 			if (idle >= limit) {
-				if (reported.get(file) !== roll.lastMessageAt) {
-					reported.set(file, roll.lastMessageAt);
+				const prev = reported.get(file);
+				const same = prev?.at === roll.lastMessageAt;
+				if (!same || now - prev.sentAt >= REMIND_MIN * MIN) {
+					const count = same ? prev.count + 1 : 1;
+					reported.set(file, { at: roll.lastMessageAt, sentAt: now, count });
 					const last = roll.ops.at(-1);
+					// 只写工具名会被读成“还在等”；工具早已返回、模型不再回话是另一种卡法，处理方式不同
+					const returnedAt = last?.status && last.secs !== undefined
+						? new Date(last.at + last.secs * 1000).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false })
+						: undefined;
 					const step = roll.modelError ? `模型请求报错后无后续（${roll.modelError}）`
-						: last ? `${last.name}（${last.intent || "无说明"}）` : "（无工具调用，可能是模型没回）";
+						: !last ? "（无工具调用，可能是模型没回）"
+							: returnedAt ? `${last.name}（${last.intent || "无说明"}）已于 ${returnedAt} 返回，之后模型没有回应`
+								: `${last.name}（${last.intent || "无说明"}）仍在运行`;
+					const repeat = count > 1 ? `（仍未恢复，第 ${count} 次提醒）` : "";
 					pi.sendMessage(
 						{
 							customType: "dianmao",
-							content: `[点卯] 小工 ${name} 已 ${idle} 分钟没有新消息，可能卡住了。最后一步：${step}。对话记录：${file}`,
+							content: `[点卯] 小工 ${name} 已 ${idle} 分钟没有新消息，可能卡住了${repeat}。最后一步：${step}。${returnedAt && !roll.modelError ? "这种情况发 IRC 唤不醒它（消息要等这一轮结束才送达），可考虑停掉重派。" : ""}对话记录：${file}`,
 							display: true,
-							details: { kind: "stall", name, evidence: `${idle} 分钟无新消息`, lastStep: step, file } satisfies AlertCard,
+							details: { kind: "stall", name, evidence: `${idle} 分钟无新消息${repeat}`, lastStep: step, file } satisfies AlertCard,
 						},
 						{ deliverAs: "aside" },
 					);

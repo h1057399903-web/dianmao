@@ -574,3 +574,41 @@ test("孙代理的记录在子目录里：照样清点和报卡住，名字按 �
 	expect(sent[0]).toContain("小工 Parent>Child ");
 	expect(statuses.at(-1)).toContain("2 在岗");
 });
+
+test("工具已返回、模型不再回话：卡片写明已返回时间，不能读成“还在等”", () => {
+	const now = Date.now();
+	setSystemTime(now);
+	const dir = mkdtempSync(join(tmpdir(), "dianmao-returned-"));
+	const back = now - 21 * MIN;
+	writeFileSync(join(dir, "Returned.jsonl"), [call(now - 30 * MIN, "w", {}, "wait", "等审查结果"), result(back, "w")].join("\n") + "\n");
+	writeFileSync(join(dir, "Running.jsonl"), [call(now - 21 * MIN, "w", {}, "wait", "等审查结果")].join("\n") + "\n");
+	const p = patrol(dir);
+	p.tick();
+	expect(p.sent).toHaveLength(2);
+	const hhmm = new Date(back).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false });
+	expect(p.sent.find(s => s.includes("Returned"))).toContain(`已于 ${hhmm} 返回，之后模型没有回应`);
+	expect(p.sent.find(s => s.includes("Running"))).toContain("仍在运行");
+});
+
+test("同一次卡住持续：每满 60 分钟再提醒一次并标明第几次；恢复后重新计", () => {
+	const now = Date.now();
+	setSystemTime(now);
+	const dir = mkdtempSync(join(tmpdir(), "dianmao-remind-"));
+	const file = join(dir, "Worker.jsonl");
+	writeFileSync(file, [call(now - 25 * MIN, "w", {}, "wait"), result(now - 20 * MIN, "w")].join("\n") + "\n");
+	const p = patrol(dir);
+	p.tick();
+	expect(p.sent).toHaveLength(1);
+	setSystemTime(now + 59 * MIN);
+	p.tick();
+	expect(p.sent).toHaveLength(1);
+	setSystemTime(now + 60 * MIN);
+	p.tick();
+	expect(p.sent).toHaveLength(2);
+	expect(p.sent[1]).toContain("第 2 次提醒");
+	appendFileSync(file, [call(now + 61 * MIN, "x", {}, "read"), result(now + 61 * MIN, "x")].join("\n") + "\n");
+	setSystemTime(now + 81 * MIN);
+	p.tick();
+	expect(p.sent).toHaveLength(3);
+	expect(p.sent[2]).not.toContain("次提醒");
+});
