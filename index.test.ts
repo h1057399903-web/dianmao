@@ -1,5 +1,5 @@
 import { afterEach, expect, test, setSystemTime } from "bun:test";
-import { mkdtempSync, symlinkSync, writeFileSync, appendFileSync, utimesSync } from "node:fs";
+import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync, appendFileSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import dianmao, { progressProbability, rollCall } from "./index.ts";
@@ -550,4 +550,27 @@ test("成功的 git commit 算施工成果；提交失败不算", () => {
 	p.tick();
 	expect(p.sent).toHaveLength(1);
 	expect(p.sent[0]).toContain("小工 Failed ");
+});
+
+test("孙代理的记录在子目录里：照样清点和报卡住，名字按 父>子 显示，结果文件按同目录判断", () => {
+	const now = Date.now();
+	setSystemTime(now);
+	const dir = mkdtempSync(join(tmpdir(), "dianmao-nested-"));
+	const parentFile = join(dir, "Parent.jsonl");
+	writeFileSync(parentFile, [header(now - 30 * MIN, "parent-id", `${dir}.jsonl`), call(now, "w", { command: "x" }, "wait")].join("\n") + "\n");
+	mkdirSync(join(dir, "Parent"));
+	// 文件头 parentSession 是父代理文件路径，不能让父代理被当成“已被复活取代”
+	writeFileSync(join(dir, "Parent", "Parent.Child.jsonl"), [header(now - 25 * MIN, "child-id", parentFile), call(now - 22 * MIN, "a"), result(now - 22 * MIN, "a")].join("\n") + "\n");
+	writeFileSync(join(dir, "Parent", "Parent.Done.jsonl"), [header(now - 25 * MIN, "done-id", parentFile), call(now - 22 * MIN, "a"), result(now - 22 * MIN, "a")].join("\n") + "\n");
+	writeFileSync(join(dir, "Parent", "Parent.Done.md"), "ok");
+	const statuses: string[] = [];
+	let tick = () => {};
+	const ctx = { agent: { kind: "main" }, sessionManager: { getArtifactsDir: () => dir }, setInterval: (fn: () => void) => { tick = fn; }, ui: { setStatus: (_k: string, v: string) => statuses.push(v) } };
+	const sent: string[] = [];
+	const pi = { on: (_ev: string, h: (e: unknown, c: unknown) => void) => h({}, ctx), sendMessage: (m: { content: string }) => sent.push(m.content), registerMessageRenderer: () => {}, registerCommand: () => {} };
+	dianmao(pi as unknown as Parameters<typeof dianmao>[0]);
+	tick();
+	expect(sent).toHaveLength(1);
+	expect(sent[0]).toContain("小工 Parent>Child ");
+	expect(statuses.at(-1)).toContain("2 在岗");
 });

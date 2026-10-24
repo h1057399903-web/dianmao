@@ -415,30 +415,36 @@ export default function dianmao(pi: ExtensionAPI) {
 		}
 		activeCount = 0;
 		readFailures = 0;
-		const files = readdirSync(dir).filter(f => f.endsWith(".jsonl") && !f.startsWith("__"));
-		const present = new Set(files.map(f => join(dir, f)));
+		// 孙代理记录在 <父>/<父>.<子>.jsonl；递归清点，跳过隐藏与 __ 开头的条目
+		const files = readdirSync(dir, { recursive: true, encoding: "utf8" })
+			.filter(rel => rel.endsWith(".jsonl") && !rel.split("/").some(part => part.startsWith(".") || part.startsWith("__")));
+		const present = new Set(files.map(rel => join(dir, rel)));
 		for (const file of cursors.keys()) if (!present.has(file)) cursors.delete(file);
 		for (const file of headers.keys()) if (!present.has(file)) headers.delete(file);
-		// 复活的小工另起一份带时间戳名的记录，parentSession 指回原记录：沿用原名，原记录不再单独清点
-		const nameById = new Map<string, string>();
+		// 复活的小工另起一份带时间戳名的记录，parentSession 是原记录的会话 id：沿用原名，原记录不再单独清点。
+		// 派生出的子代理 parentSession 是父记录的文件路径，不会命中 id，不算复活
+		const fileById = new Map<string, string>();
 		const superseded = new Set<string>();
-		for (const f of files) {
+		for (const rel of files) {
 			let header: Header | undefined;
-			try { header = sessionHeader(join(dir, f), headers); } catch { continue; }
+			try { header = sessionHeader(join(dir, rel), headers); } catch { continue; }
 			if (!header) continue;
-			nameById.set(header.id, f.slice(0, -6));
+			fileById.set(header.id, rel);
 			if (header.parent) superseded.add(header.parent);
 		}
-		for (const f of files) {
-			const file = join(dir, f);
+		for (const rel of files) {
+			const file = join(dir, rel);
 			const header = headers.get(file);
 			if (header && superseded.has(header.id)) continue;
-			let name = f.slice(0, -6);
-			for (let parent = header?.parent, hops = 0; parent && nameById.has(parent) && hops < 8; hops++) {
-				name = nameById.get(parent)!;
-				parent = headers.get(join(dir, `${name}.jsonl`))?.parent;
+			let nameRel = rel;
+			for (let parent = header?.parent, hops = 0; parent && fileById.has(parent) && hops < 8; hops++) {
+				nameRel = fileById.get(parent)!;
+				parent = headers.get(join(dir, nameRel))?.parent;
 			}
-			const done = join(dir, `${name}.md`);
+			const stem = basename(nameRel, ".jsonl");
+			// 和 OMP 的子代理列表一致：孙代理显示为 父>子
+			const name = nameRel.includes("/") ? stem.replaceAll(".", ">") : stem;
+			const done = join(dir, nameRel.slice(0, -6) + ".md");
 			let roll: Roll;
 			// 单个记录读失败（刚被移走、权限）只跳过它，下一轮再看
 			try {
