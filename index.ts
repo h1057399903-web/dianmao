@@ -434,6 +434,7 @@ export default function dianmao(pi: ExtensionAPI) {
 			fileById.set(header.id, rel);
 			if (header.parent) superseded.add(header.parent);
 		}
+		const workers: { file: string; name: string; done: string; family: string; waiting: boolean; roll: Roll }[] = [];
 		for (const rel of files) {
 			const file = join(dir, rel);
 			const header = headers.get(file);
@@ -458,8 +459,14 @@ export default function dianmao(pi: ExtensionAPI) {
 				if (existsSync(done) && statSync(done).mtimeMs >= roll.lastMessageAt) continue;
 			} catch { readFailures++; cursors.delete(file); continue; }
 			if (roll.finished || !roll.lastMessageAt) continue;
-			activeCount++;
-
+			const last = roll.ops.at(-1);
+			// family：同一顶层小工派出的一支；waiting：最后一步是还没返回的 wait
+			workers.push({ file, name, done, family: nameRel.split("/")[0].replace(/\.jsonl$/, ""), waiting: last?.name === "wait" && last.status === undefined, roll });
+		}
+		activeCount = workers.length;
+		// 卡在 wait 上、而同一支里还有没在等的在岗成员：它在等那位干活（如等兄弟审查员），那位由点卯单独盯
+		const familiesWorking = new Set(workers.filter(w => !w.waiting).map(w => w.family));
+		for (const { file, name, done, family, waiting, roll } of workers) {
 			const retry = roll.quotaRetry;
 			if (retry) {
 				const minutes = Math.floor((now - retry.since) / MIN);
@@ -487,6 +494,7 @@ export default function dianmao(pi: ExtensionAPI) {
 			// 正在跑显式设了长 timeout 的命令，等它自己的截止时间过了再算卡住
 			const limit = Math.max(STALL_MIN, roll.toolTimeoutSec > 0 ? Math.ceil(roll.toolTimeoutSec / 60) + 2 : 0);
 			if (idle >= limit) {
+				if (waiting && familiesWorking.has(family)) continue;
 				const prev = reported.get(file);
 				const same = prev?.at === roll.lastMessageAt;
 				if (!same || now - prev.sentAt >= REMIND_MIN * MIN) {

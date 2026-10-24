@@ -612,3 +612,29 @@ test("同一次卡住持续：每满 60 分钟再提醒一次并标明第几次�
 	expect(p.sent).toHaveLength(3);
 	expect(p.sent[2]).not.toContain("次提醒");
 });
+
+test("在 wait 上等同一支里还在干活的审查员：不报；审查员卡了只报审查员；全家都在等或等的是后台命令照常报", () => {
+	const now = Date.now();
+	setSystemTime(now);
+	const dir = mkdtempSync(join(tmpdir(), "dianmao-family-"));
+	const waiting = [call(now - 22 * MIN, "w", {}, "wait", "等独立审查")].join("\n") + "\n";
+	// 父与兄弟都在等，审查员在干活
+	writeFileSync(join(dir, "Migrate.jsonl"), waiting);
+	mkdirSync(join(dir, "Migrate"));
+	writeFileSync(join(dir, "Migrate", "Migrate.Rebase.jsonl"), waiting);
+	const reviewer = join(dir, "Migrate", "Migrate.Review.jsonl");
+	writeFileSync(reviewer, [call(now - MIN, "r", { path: "a.ts" }, "read"), result(now - MIN, "r")].join("\n") + "\n");
+	// 另一支：全家都在等（互相等）
+	writeFileSync(join(dir, "Deadlock.jsonl"), waiting);
+	mkdirSync(join(dir, "Deadlock"));
+	writeFileSync(join(dir, "Deadlock", "Deadlock.Child.jsonl"), waiting);
+	// 单独一个在 wait 后台命令
+	writeFileSync(join(dir, "Watcher.jsonl"), waiting);
+	const p = patrol(dir);
+	p.tick();
+	expect(p.sent.map(s => s.match(/小工 (\S+) /)?.[1]).sort()).toEqual(["Deadlock", "Deadlock>Child", "Watcher"]);
+	// 审查员也卡住：只报审查员，等它的两个仍不报
+	setSystemTime(now + 20 * MIN);
+	p.tick();
+	expect(p.sent.slice(3).map(s => s.match(/小工 (\S+) /)?.[1])).toEqual(["Migrate>Review"]);
+});
