@@ -638,3 +638,31 @@ test("在 wait 上等同一支里还在干活的审查员：不报；审查员�
 	p.tick();
 	expect(p.sent.slice(3).map(s => s.match(/小工 (\S+) /)?.[1])).toEqual(["Migrate>Review"]);
 });
+
+test("原地打转：连续 20 次以上只差数字的快速相同调用，不靠 SubQ 也报；翻页读和慢轮询不算", async () => {
+	const now = Date.now();
+	setSystemTime(now);
+	const dir = mkdtempSync(join(tmpdir(), "dianmao-loop-"));
+	const series = (name: string, n: number, step: number, make: (i: number) => [Record<string, unknown>, string, string]) => {
+		const lines = [JSON.stringify({ type: "message", timestamp: iso(now - n * step - MIN), message: { role: "user", content: "# Target\n只读审查 #1911" } })];
+		for (let i = 0; i < n; i++) {
+			const [args, tool, text] = make(i);
+			const at = now - (n - i) * step;
+			lines.push(call(at, `${name}${i}`, args, tool, `Distinct marker ${i}`), result(at + Math.min(step - 1000, 60_000), `${name}${i}`, false, text));
+		}
+		writeFileSync(join(dir, `${name}.jsonl`), lines.join("\n") + "\n");
+	};
+	series("Looper", 25, 4000, i => [{ command: `echo z${1100 + i}` }, "bash", `z${1100 + i}`]);
+	series("Pager", 25, 4000, i => [{ path: `a.ts:${i * 50 + 1}-${i * 50 + 50}` }, "read", `line ${i}: const v${"x".repeat(i)} = ${i};`]);
+	series("Poller", 25, 70_000, () => [{}, "wait", "Nothing finished yet"]);
+	globalThis.fetch = (() => Promise.reject(new Error("SubQ unavailable"))) as unknown as typeof fetch;
+	const p = patrol(dir);
+	p.tick();
+	await settle();
+	expect(p.sent).toHaveLength(1);
+	expect(p.sent[0]).toContain("小工 Looper ");
+	expect(p.sent[0]).toContain("连续 25 次");
+	p.tick();
+	await settle();
+	expect(p.sent).toHaveLength(1);
+});

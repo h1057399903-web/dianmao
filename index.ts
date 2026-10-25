@@ -17,6 +17,7 @@ const SPIN_MIN_OPS = num("DIANMAO_SPIN_MIN_OPS", 10);
 const SPIN_THRESHOLD = num("DIANMAO_SPIN_THRESHOLD", 0.2);
 const DELIVERY_MIN = num("DIANMAO_DELIVERY_MIN", 60);
 const REMIND_MIN = num("DIANMAO_REMIND_MIN", 60);
+const LOOP_OPS = num("DIANMAO_LOOP_OPS", 20);
 const POLL_MS = num("DIANMAO_POLL_SEC", 60) * 1000;
 const READ_BYTES = 64 * 1024;
 const SUBQ_ENDPOINT = "https://api.subq.ai/v1/systemone";
@@ -36,6 +37,8 @@ export type Roll = {
 	taskStartedAt?: number; requiresChanges: boolean; lastChangeAt?: number;
 	/** 最后一条是模型报错时的错误摘要；之后有任何消息即清除 */
 	modelError?: string;
+	/** 结尾连续的“只差数字”的相同快速调用（请求和结果去掉数字后都一样） */
+	loop?: { key: string; since: number; count: number; step: string };
 };
 type Part = { type?: unknown; id?: unknown; name?: unknown; intent?: unknown; arguments?: Record<string, unknown> };
 // 只读可选字段并按值比较，形状不对的条目被跳过
@@ -99,12 +102,12 @@ function activity(name: string, args: Record<string, unknown>): Op["activity"] {
 class Transcript {
 	snapshot: Roll = { lastMessageAt: 0, finished: false, ops: [], toolTimeoutSec: 0, goal: "", requiresChanges: false };
 	private errorRun = 0;
-	private pending = new Map<string, { op: Op; timeout: number }>();
+	private pending = new Map<string, { op: Op; timeout: number; shape: string }>();
 	// 复活出的新记录会带上旧历史；文件头时间之前的事都不算这次在岗的时长
 	private sessionStartedAt = 0;
 
 	consume(lines: string[]): Roll {
-		let { lastMessageAt, finished, quotaRetry, goal, taskStartedAt, requiresChanges, lastChangeAt, modelError } = this.snapshot;
+		let { lastMessageAt, finished, quotaRetry, goal, taskStartedAt, requiresChanges, lastChangeAt, modelError, loop } = this.snapshot;
 		let ops = this.snapshot.ops;
 		let errorRun = this.errorRun;
 		const pending = this.pending;
@@ -122,6 +125,7 @@ class Transcript {
 				ops = [];
 				pending.clear();
 				errorRun = 0;
+				loop = undefined;
 			}
 			const m = e.message;
 			if (e.type !== "message" || !m || typeof m !== "object") continue;
@@ -139,6 +143,7 @@ class Transcript {
 					ops = [];
 					pending.clear();
 					errorRun = 0;
+					loop = undefined;
 				}
 			}
 			// 网关可能用 503 包住实际的 429；只检查模型错误，不把工具正文里的“429”算成限流。
@@ -172,6 +177,11 @@ class Transcript {
 						const text = textContent(m.content);
 						const stable = text.replace(/^\s*(?:⟨)?(?:Wall(?: time)?|Duration|Time):.*$/gmi, "").replace(/\[\d+(?:\.\d+)?(?:ms|s)\]/g, "[duration]").trim();
 						if (stable) p.op.resultHash = fingerprint(stable);
+						// 自增计数器（echo z1116、z1117…）能骗过逐次指纹；去掉数字后请求和结果都一样、且秒回的，算同一次原地打转
+						const key = p.op.secs <= 5 ? fingerprint(`${p.shape}\u0000${stable.replace(/\d+/g, "N")}`) : undefined;
+						loop = !key ? undefined
+							: loop?.key === key ? { ...loop, count: loop.count + 1, step: `${p.op.name}（${p.op.intent || "无说明"}）` }
+								: { key, since: p.op.at, count: 1, step: `${p.op.name}（${p.op.intent || "无说明"}）` };
 						if (p.op.activity === "test") {
 							const tests: NonNullable<Op["tests"]> = {};
 							for (const match of text.matchAll(/\b(\d+)\s+(pass(?:ed)?|fail(?:ed)?)\b/gi)) {
@@ -179,6 +189,8 @@ class Transcript {
 							}
 							if (Object.keys(tests).length) p.op.tests = tests;
 						}
+					} else {
+						loop = undefined;
 					}
 				}
 				continue;
@@ -196,14 +208,14 @@ class Transcript {
 				};
 				ops.push(op);
 				if (ops.length > Math.max(256, SPIN_MIN_OPS * 2)) ops = ops.slice(-Math.max(128, SPIN_MIN_OPS));
-				pending.set(String(part.id), { op, timeout: Number(part.arguments?.timeout) || 0 });
+				pending.set(String(part.id), { op, timeout: Number(part.arguments?.timeout) || 0, shape: `${op.name}${JSON.stringify(args).replace(/\d+/g, "N")}` });
 			}
 		}
 		const toolTimeoutSec = Math.max(0, ...[...pending.values()].map(p => p.timeout));
 		this.errorRun = errorRun;
 		const since = this.sessionStartedAt;
 		this.snapshot = {
-			lastMessageAt: Math.max(lastMessageAt, since), finished, ops, toolTimeoutSec, quotaRetry, goal, modelError,
+			lastMessageAt: Math.max(lastMessageAt, since), finished, ops, toolTimeoutSec, quotaRetry, goal, modelError, loop,
 			taskStartedAt: taskStartedAt === undefined ? undefined : Math.max(taskStartedAt, since), requiresChanges,
 			lastChangeAt: lastChangeAt === undefined ? undefined : Math.max(lastChangeAt, since),
 		};
@@ -384,6 +396,7 @@ export default function dianmao(pi: ExtensionAPI) {
 	// 记录路径 -> 这次卡住的最后消息时间、上次提醒时间与次数；同一次卡住每满 REMIND_MIN 再提醒
 	const reported = new Map<string, { at: number; sentAt: number; count: number }>();
 	const quotaReported = new Map<string, number>(); // 记录路径 -> 已通知的额度错误轮次起点
+	const loopReported = new Map<string, number>(); // 记录路径 -> 已通知的原地打转起点
 	// 记录路径 -> 当前空转观察窗口的起点。第一次看到就开始计时，不跟着日志尾部滑动
 	const windowStart = new Map<string, number>();
 	const deliveryReported = new Map<string, number>();
@@ -412,6 +425,7 @@ export default function dianmao(pi: ExtensionAPI) {
 			reported.clear();
 			quotaReported.clear();
 			deliveryReported.clear();
+			loopReported.clear();
 			windowStart.clear();
 			lastSubQ = "尚未到检查窗口";
 		}
@@ -516,6 +530,26 @@ export default function dianmao(pi: ExtensionAPI) {
 							content: `[点卯] 小工 ${name} 已 ${idle} 分钟没有新消息，可能卡住了${repeat}。最后一步：${step}。${returnedAt && !roll.modelError ? "这种情况发 IRC 唤不醒它（消息要等这一轮结束才送达），可考虑停掉重派。" : ""}对话记录：${file}`,
 							display: true,
 							details: { kind: "stall", name, evidence: `${idle} 分钟无新消息${repeat}`, lastStep: step, file } satisfies AlertCard,
+						},
+						{ deliverAs: "aside" },
+					);
+				}
+				continue;
+			}
+
+			const loop = roll.loop;
+			if (loop && loop.count >= LOOP_OPS) {
+				if (loopReported.get(file) !== loop.since) {
+					loopReported.set(file, loop.since);
+					windowStart.set(file, now); // 同一件事不再让 SubQ 另报一次
+					const minutes = Math.max(1, Math.round((now - loop.since) / MIN));
+					const evidence = `${minutes} 分钟内连续 ${loop.count} 次相同的秒回调用（只差数字）`;
+					pi.sendMessage(
+						{
+							customType: "dianmao",
+							content: `[点卯] 小工 ${name} 在原地打转：${evidence}，请求和结果去掉数字后完全一样。最近一次：${loop.step}。这是记录里的重复，不依赖 SubQ 判断；请让它收口交付，或停掉重派。对话记录：${file}`,
+							display: true,
+							details: { kind: "spin", name, evidence, lastStep: loop.step, file } satisfies AlertCard,
 						},
 						{ deliverAs: "aside" },
 					);
